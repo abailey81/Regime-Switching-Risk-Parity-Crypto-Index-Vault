@@ -320,76 +320,144 @@ class UniverseScreener:
 
         import ccxt
 
-        # Try multiple exchanges — Binance is geo-blocked in some regions (UK, etc.)
-        _exchange_priority = ["bybit", "gate", "binanceus", "binance", "okx"]
-        exchange = None
-        for _exch_name in _exchange_priority:
+        # ── Load API keys from environment for authenticated (faster) connections ──
+        _dotenv_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))), ".env")
+        _env_keys: Dict[str, str] = {}
+        if os.path.exists(_dotenv_path):
+            with open(_dotenv_path) as _ef:
+                for _line in _ef:
+                    _line = _line.strip()
+                    if _line and not _line.startswith("#") and "=" in _line:
+                        _k, _v = _line.split("=", 1)
+                        _env_keys[_k.strip()] = _v.strip()
+
+        def _make_exchange(name: str):
+            """Create exchange with API keys if available (authenticated = higher rate limits)."""
+            _cls = getattr(ccxt, name, None)
+            if _cls is None:
+                return None
+            opts = {"enableRateLimit": True}
+            prefix = name.upper().replace("BINANCEUS", "BINANCE")
+            if f"{prefix}_API_KEY" in _env_keys:
+                opts["apiKey"] = _env_keys[f"{prefix}_API_KEY"]
+            if f"{prefix}_SECRET_KEY" in _env_keys:
+                opts["secret"] = _env_keys[f"{prefix}_SECRET_KEY"]
+            elif f"{prefix}_PRIVATE_KEY" in _env_keys:
+                opts["secret"] = _env_keys[f"{prefix}_PRIVATE_KEY"]
+            if f"{prefix}_PASSPHRASE" in _env_keys:
+                opts["password"] = _env_keys[f"{prefix}_PASSPHRASE"]
+            return _cls(opts)
+
+        # ── Connect to ALL exchanges in parallel for maximum universe coverage ──
+        _exchange_names = ["bybit", "gate", "okx", "binanceus", "binance", "kraken", "coinbase"]
+        _safe_log(f"Stage 1: Connecting to {len(_exchange_names)} exchanges in parallel...")
+
+        _connected_exchanges: Dict[str, object] = {}
+        _all_markets: Dict[str, dict] = {}  # symbol → market info (deduped, keep highest volume)
+
+        def _connect_exchange(ename: str):
             try:
-                _cls = getattr(ccxt, _exch_name, None)
-                if _cls is None:
-                    continue
-                _safe_log(f"Stage 1: Trying {_exch_name}...")
-                exchange = _cls({"enableRateLimit": True})
-                exchange.load_markets()
-                _safe_log(f"Stage 1: Connected to {_exch_name} ({len(exchange.markets)} markets)")
-                self._connected_exchange = _exch_name
-                break
-            except Exception as _e:
-                _safe_log(f"Stage 1: {_exch_name} failed ({_e}), trying next...", "warning")
-                exchange = None
-        if exchange is None:
+                ex = _make_exchange(ename)
+                if ex is None:
+                    return ename, None, {}
+                ex.load_markets()
+                return ename, ex, ex.markets
+            except Exception as e:
+                return ename, None, {}
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=len(_exchange_names)) as pool:
+            futs = {pool.submit(_connect_exchange, n): n for n in _exchange_names}
+            for fut in as_completed(futs):
+                ename, ex, markets = fut.result()
+                if ex is not None:
+                    _connected_exchanges[ename] = ex
+                    _safe_log(f"  ✓ {ename}: {len(markets)} markets (authenticated: {'apiKey' in (ex.apiKey or '')})"
+                              if hasattr(ex, 'apiKey') and ex.apiKey else
+                              f"  ✓ {ename}: {len(markets)} markets")
+                else:
+                    _safe_log(f"  ✗ {ename}: failed", "warning")
+
+        if not _connected_exchanges:
             _safe_log("Stage 1: All exchanges failed!", "error")
             return pd.DataFrame(columns=["symbol", "volume_24h", "market_cap", "exchange"])
-        exchange.load_markets()
 
-        records = []
-        for pair, market in exchange.markets.items():
-            # Filter: spot, active, USDT quote
-            if not market.get("spot", False):
-                continue
-            if not market.get("active", True):
-                continue
-            if market.get("quote", "") != "USDT":
-                continue
+        self._connected_exchanges = _connected_exchanges
+        self._connected_exchange = list(_connected_exchanges.keys())[0]
+        _safe_log(f"Stage 1: {len(_connected_exchanges)} exchanges connected")
 
-            base = market.get("base", "")
-            if not base or base in _STABLECOINS:
-                continue
+        # ── Merge all USDT spot markets across all exchanges (dedup by highest volume) ──
 
-            records.append({
-                "symbol": base,
-                "pair": pair,
-                "exchange": "binance",
-            })
+        # ── Scan ALL exchanges in parallel for USDT spot pairs ──
+        _safe_log(f"Stage 1: Scanning {len(_connected_exchanges)} exchanges for USDT pairs...")
 
-        if not records:
-            _safe_log("Stage 1: No USDT pairs found on Binance!", "error")
+        _all_records: List[dict] = []
+        _record_lock = __import__('threading').Lock()
+
+        def _scan_exchange(ename: str, ex):
+            """Scan one exchange for USDT spot pairs + fetch tickers."""
+            local_records = []
+            for pair, market in ex.markets.items():
+                if not market.get("spot", False):
+                    continue
+                if not market.get("active", True):
+                    continue
+                quote = market.get("quote", "")
+                if quote not in ("USDT", "USD"):
+                    continue
+                base = market.get("base", "")
+                if not base or base in _STABLECOINS:
+                    continue
+                local_records.append({
+                    "symbol": base,
+                    "pair": pair,
+                    "exchange": ename,
+                })
+
+            # Fetch 24h tickers for volume data
+            tickers = {}
+            try:
+                tickers = ex.fetch_tickers()
+            except Exception:
+                pass
+
+            for rec in local_records:
+                ticker = tickers.get(rec["pair"], {})
+                rec["volume_24h_usd"] = float(ticker.get("quoteVolume", 0) or 0)
+                rec["last_price"] = float(ticker.get("last", 0) or 0)
+
+            with _record_lock:
+                _all_records.extend(local_records)
+
+            return ename, len(local_records)
+
+        scan_bar = tqdm(total=len(_connected_exchanges), desc="Scanning exchanges", unit="exch", leave=False)
+        with ThreadPoolExecutor(max_workers=len(_connected_exchanges)) as pool:
+            futs = {pool.submit(_scan_exchange, n, ex): n for n, ex in _connected_exchanges.items()}
+            for fut in as_completed(futs):
+                ename, count = fut.result()
+                scan_bar.set_postfix(exchange=ename, pairs=count)
+                scan_bar.update(1)
+        scan_bar.close()
+
+        if not _all_records:
+            _safe_log("Stage 1: No USDT pairs found on any exchange!", "error")
             return pd.DataFrame()
 
-        _safe_log(f"Stage 1: Found {len(records)} USDT pairs, fetching 24h tickers...")
+        _safe_log(f"Stage 1: Found {len(_all_records)} total pairs across all exchanges")
 
-        # Fetch 24h ticker data for volume/price
-        _time.sleep(_REQUEST_DELAY_S)
-        try:
-            tickers = exchange.fetch_tickers()
-        except Exception as e:
-            _safe_log(f"Stage 1: Failed to fetch tickers: {e}", "error")
-            tickers = {}
+        df = pd.DataFrame(_all_records)
 
-        for rec in records:
-            ticker = tickers.get(rec["pair"], {})
-            rec["volume_24h_usd"] = float(ticker.get("quoteVolume", 0) or 0)
-            rec["last_price"] = float(ticker.get("last", 0) or 0)
-
-        df = pd.DataFrame(records)
-
-        # Remove duplicates (keep highest volume per base symbol)
+        # Deduplicate: keep highest volume per base symbol
         df = df.sort_values("volume_24h_usd", ascending=False)
         df = df.drop_duplicates(subset="symbol", keep="first")
 
         # Sort by volume, take top N
         df = df.sort_values("volume_24h_usd", ascending=False).head(top_n)
         df = df.reset_index(drop=True)
+
+        _safe_log(f"Stage 1: {len(df)} unique assets after dedup (from {len(_all_records)} raw pairs)")
 
         self.universe_df = df
 
@@ -466,22 +534,29 @@ class UniverseScreener:
             self.ohlcv_data = data
             return data
 
-        # Pre-create exchange pools for MULTIPLE exchanges (fallback cascade)
-        _exchange_order = ["bybit", "gate", "binanceus", "okx", "kraken"]
-        # Remove any that failed during Stage 1
-        _primary = getattr(self, '_connected_exchange', 'bybit')
+        # Reuse authenticated exchanges from Stage 1, create pools for parallel fetching
+        _connected = getattr(self, '_connected_exchanges', {})
+        _exchange_order = list(_connected.keys()) if _connected else ["bybit", "gate", "okx"]
+        # Ensure primary is first
+        _primary = getattr(self, '_connected_exchange', _exchange_order[0] if _exchange_order else 'bybit')
         if _primary in _exchange_order:
             _exchange_order.remove(_primary)
         _exchange_order.insert(0, _primary)
 
         _n_workers = min(20, len(symbols_to_fetch))
         _exchange_pools: Dict[str, List] = {}
-        _safe_log(f"Stage 2: Pre-initializing {_n_workers} connections across {len(_exchange_order)} exchanges...")
+        _safe_log(f"Stage 2: Creating {_n_workers} worker connections across "
+                   f"{len(_exchange_order)} authenticated exchanges...")
         for _ename in _exchange_order:
             try:
-                _cls = getattr(ccxt, _ename, None)
-                if _cls is None:
-                    continue
+                # Reuse Stage 1 exchange config (has API keys)
+                if _ename in _connected:
+                    _template = _connected[_ename]
+                    _cls = type(_template)
+                else:
+                    _cls = getattr(ccxt, _ename, None)
+                    if _cls is None:
+                        continue
                 pool_list = []
                 for _ in range(max(4, _n_workers // len(_exchange_order))):
                     pool_list.append(_cls({"enableRateLimit": True}))
