@@ -859,16 +859,33 @@ class UniverseScreener:
         # If YF gets data first → use it. If an exchange gets it first → use it.
         # This maximizes coverage and minimizes total wall-clock time.
 
-        # Symbols that YF didn't get — go to exchange cascade
-        symbols_to_fetch = _yf_failed_syms
-        _safe_log(f"Stage 2: {_yf_succeeded} from Yahoo Finance, {len(symbols_to_fetch)} remaining for exchange cascade")
+        # Symbols that YF didn't get — filter out leveraged/synthetic tokens first
+        import re as _re
+        _leveraged_pattern = _re.compile(r'\d+[LS]$|3L$|3S$|5L$|5S$', _re.IGNORECASE)
+        _real_failed = [s for s in _yf_failed_syms if not _leveraged_pattern.search(s)]
+        _leveraged_skipped = len(_yf_failed_syms) - len(_real_failed)
+
+        _safe_log(f"Stage 2: {_yf_succeeded} from Yahoo Finance, "
+                   f"{_leveraged_skipped} leveraged tokens skipped, "
+                   f"{len(_real_failed)} real assets for exchange cascade")
+
+        symbols_to_fetch = _real_failed
+
+        # Skip exchange cascade if we already have plenty of assets (500+)
+        _min_target = 400
+        if len(data) >= _min_target and len(symbols_to_fetch) > 50:
+            _safe_log(f"Stage 2: Already have {len(data)} assets (>= {_min_target}), "
+                       f"skipping exchange cascade for {len(symbols_to_fetch)} remaining")
+            symbols_to_fetch = []
 
         if not symbols_to_fetch:
             self.ohlcv_data = data
-            _safe_log(f"Stage 2: All {len(data)} assets fetched (YF: {_yf_succeeded}, cache: {cached_count})")
+            _safe_log(f"Stage 2: Complete — {len(data)} assets "
+                       f"(YF: {_yf_succeeded}, cache: {cached_count}, "
+                       f"leveraged skipped: {_leveraged_skipped})")
             return data
 
-        _safe_log(f"Stage 2: Exchange cascade for {len(symbols_to_fetch)} remaining assets...")
+        _safe_log(f"Stage 2: Exchange cascade for {len(symbols_to_fetch)} remaining real assets...")
 
         # Reuse authenticated exchanges from Stage 1, create pools for parallel fetching
         _connected = getattr(self, '_connected_exchanges', {})
