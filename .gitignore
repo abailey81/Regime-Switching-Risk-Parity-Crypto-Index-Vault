@@ -21,3 +21,6 @@ dashboard/dist/
 dashboard/node_modules/
 *.log
 master_plan_v2.md
+Individual Coursework*.docx
+.claude/
+CLAUDE.md
