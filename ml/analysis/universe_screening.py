@@ -466,15 +466,30 @@ class UniverseScreener:
             self.ohlcv_data = data
             return data
 
-        # Concurrent fetching with rate limiting
+        # Pre-create a pool of exchange instances (one per worker thread)
+        # Avoids the overhead of load_markets() on every single fetch
+        _exch_name = getattr(self, '_connected_exchange', 'bybit')
+        _n_workers = min(20, len(symbols_to_fetch))
+        _exchange_pool: List = []
+        _safe_log(f"Stage 2: Pre-initializing {_n_workers} {_exch_name} connections...")
+        for _ in range(_n_workers):
+            _cls = getattr(ccxt, _exch_name, ccxt.bybit)
+            _exchange_pool.append(_cls({"enableRateLimit": True}))
+        _pool_lock = __import__('threading').Lock()
+        _pool_idx = [0]  # mutable counter for round-robin
+
+        def _get_exchange_from_pool():
+            """Round-robin exchange instance assignment (thread-safe)."""
+            with _pool_lock:
+                idx = _pool_idx[0] % len(_exchange_pool)
+                _pool_idx[0] += 1
+                return _exchange_pool[idx]
+
+        # Concurrent fetching — maximum parallelism
         def _fetch_single(sym: str) -> Tuple[str, Optional[pd.DataFrame]]:
-            """Fetch OHLCV for a single symbol. Thread-safe with per-call delay."""
-            _time.sleep(_REQUEST_DELAY_S)
+            """Fetch OHLCV for a single symbol using pooled exchange instance."""
             try:
-                # Use the same exchange that worked for universe fetch
-                _exch_name = getattr(self, '_connected_exchange', 'bybit')
-                _cls = getattr(ccxt, _exch_name, ccxt.bybit)
-                ex = _cls({"enableRateLimit": True})
+                ex = _get_exchange_from_pool()
                 pair = f"{sym}/USDT"
                 all_candles = []
                 current_ts = since_ts
@@ -490,7 +505,7 @@ class UniverseScreener:
                     if last_ts <= current_ts:
                         break
                     current_ts = last_ts + 1
-                    _time.sleep(_REQUEST_DELAY_S)
+                    # ccxt enableRateLimit handles throttling automatically
 
                 if not all_candles:
                     return sym, None
@@ -514,8 +529,8 @@ class UniverseScreener:
                 logger.debug("Stage 2: Failed to fetch %s: %s", sym, e)
                 return sym, None
 
-        # Execute with ThreadPoolExecutor
-        max_workers = min(10, len(symbols_to_fetch))
+        # Execute with ThreadPoolExecutor — 20 parallel workers
+        max_workers = _n_workers
         succeeded = 0
         failed = 0
 
