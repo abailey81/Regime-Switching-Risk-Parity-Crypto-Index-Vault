@@ -871,13 +871,6 @@ class UniverseScreener:
 
         symbols_to_fetch = _real_failed
 
-        # Skip exchange cascade if we already have plenty of assets (500+)
-        _min_target = 400
-        if len(data) >= _min_target and len(symbols_to_fetch) > 50:
-            _safe_log(f"Stage 2: Already have {len(data)} assets (>= {_min_target}), "
-                       f"skipping exchange cascade for {len(symbols_to_fetch)} remaining")
-            symbols_to_fetch = []
-
         if not symbols_to_fetch:
             self.ohlcv_data = data
             _safe_log(f"Stage 2: Complete — {len(data)} assets "
@@ -885,7 +878,91 @@ class UniverseScreener:
                        f"leveraged skipped: {_leveraged_skipped})")
             return data
 
-        _safe_log(f"Stage 2: Exchange cascade for {len(symbols_to_fetch)} remaining real assets...")
+        # ── Phase 2: CoinGecko for remaining real assets (1 req/sec, no 429s) ──
+        _safe_log(f"Stage 2: Phase 2 — CoinGecko for {len(symbols_to_fetch)} remaining real assets...")
+
+        _CG_BASE = "https://api.coingecko.com/api/v3"
+        _cg_headers = {}
+        _dotenv_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))), ".env")
+        if os.path.exists(_dotenv_path):
+            with open(_dotenv_path) as _ef:
+                for _line in _ef:
+                    if _line.strip().startswith("COINGECKO_API_KEY="):
+                        _cg_headers["x-cg-demo-api-key"] = _line.strip().split("=", 1)[1]
+                        break
+
+        # Build symbol → CoinGecko ID map
+        _sym_to_cg: Dict[str, str] = {}
+        try:
+            import requests as _req
+            _resp = _req.get(f"{_CG_BASE}/coins/list", headers=_cg_headers, timeout=30)
+            if _resp.status_code == 200:
+                for coin in _resp.json():
+                    s = coin.get("symbol", "").upper()
+                    if s not in _sym_to_cg or len(coin["id"]) < len(_sym_to_cg[s]):
+                        _sym_to_cg[s] = coin["id"]
+        except Exception:
+            pass
+
+        _cg2_ok = 0
+        _cg2_fail = 0
+        cg2_bar = tqdm(symbols_to_fetch, desc="CoinGecko (1/sec)", unit="asset", leave=True)
+        for sym in cg2_bar:
+            cg_id = _sym_to_cg.get(sym.upper())
+            if not cg_id:
+                _cg2_fail += 1
+                cg2_bar.set_postfix(ok=_cg2_ok, fail=_cg2_fail, skip="no CG id")
+                continue
+
+            _time.sleep(1.1)  # CoinGecko free = 10-30 req/min, 1/sec is safe
+            try:
+                import requests as _req
+                r = _req.get(f"{_CG_BASE}/coins/{cg_id}/ohlc",
+                             params={"vs_currency": "usd", "days": str(lookback_days)},
+                             headers=_cg_headers, timeout=30)
+                if r.status_code == 429:
+                    _time.sleep(60)
+                    r = _req.get(f"{_CG_BASE}/coins/{cg_id}/ohlc",
+                                 params={"vs_currency": "usd", "days": str(lookback_days)},
+                                 headers=_cg_headers, timeout=30)
+                if r.status_code != 200:
+                    _cg2_fail += 1
+                    continue
+
+                raw = r.json()
+                if not isinstance(raw, list) or len(raw) < 30:
+                    _cg2_fail += 1
+                    continue
+
+                df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close"])
+                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+                df = df.set_index("timestamp").sort_index()
+                df = df[~df.index.duplicated(keep="first")]
+                df["volume"] = 0.0
+                df["volume_usd"] = 0.0
+
+                cache_file = ohlcv_cache_dir / f"{sym}_daily.parquet"
+                df.to_parquet(cache_file)
+                data[sym] = df
+                _cg2_ok += 1
+
+            except Exception:
+                _cg2_fail += 1
+
+            cg2_bar.set_postfix(ok=_cg2_ok, fail=_cg2_fail)
+
+        cg2_bar.close()
+        _safe_log(f"Stage 2: CoinGecko Phase 2 — {_cg2_ok} succeeded, {_cg2_fail} failed")
+
+        self.ohlcv_data = data
+        _safe_log(f"Stage 2: TOTAL — {len(data)} assets "
+                   f"(YF: {_yf_succeeded}, CG: {_cg2_ok}, cache: {cached_count}, "
+                   f"leveraged skipped: {_leveraged_skipped})")
+        return data
+
+        # ── Phase 3 (below) only runs if Phase 2 is skipped ──
+        _safe_log(f"Stage 2: Exchange cascade for remaining assets...")
 
         # Reuse authenticated exchanges from Stage 1, create pools for parallel fetching
         _connected = getattr(self, '_connected_exchanges', {})
