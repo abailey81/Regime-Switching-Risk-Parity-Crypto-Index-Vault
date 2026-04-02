@@ -117,8 +117,205 @@ _ASSET_CLASSIFICATIONS: Dict[str, str] = {
 _DAILY_ANN_FACTOR = 365.25
 _SQRT_ANN = np.sqrt(_DAILY_ANN_FACTOR)
 
-# Binance rate-limit delay (seconds between requests)
-_REQUEST_DELAY_S = 0.05  # 50ms -> max 1200/min
+# ---------------------------------------------------------------------------
+# Advanced Rate Limiter + Retry Handler + Circuit Breaker
+# ---------------------------------------------------------------------------
+
+class _ExchangeRateLimiter:
+    """
+    Per-exchange adaptive token-bucket rate limiter with backpressure detection.
+
+    - Tracks rolling request latency per exchange (sliding window of 50)
+    - When mean latency exceeds 2× baseline → halves rate (backpressure)
+    - When latency returns to normal → gradually restores rate (+10%/request)
+    - Detects HTTP 429 responses and pauses for Retry-After duration
+    - Thread-safe via Lock
+    """
+
+    def __init__(self, exchange_name: str, max_rps: float = 10.0, burst: int = 5):
+        self.name = exchange_name
+        self.max_rps = max_rps
+        self.current_rps = max_rps
+        self.burst = burst
+        self.tokens = float(burst)
+        self.last_refill = _time.monotonic()
+        self._lock = __import__('threading').Lock()
+        self._latencies: List[float] = []  # rolling window
+        self._latency_window = 50
+        self._baseline_latency: Optional[float] = None
+        self._backpressure_active = False
+        self._paused_until = 0.0  # for HTTP 429 Retry-After
+
+    def acquire(self) -> float:
+        """Block until a token is available. Returns time waited."""
+        with self._lock:
+            # Check if paused (HTTP 429)
+            now = _time.monotonic()
+            if now < self._paused_until:
+                wait = self._paused_until - now
+                _time.sleep(wait)
+                now = _time.monotonic()
+
+            # Refill tokens
+            elapsed = now - self.last_refill
+            self.tokens = min(self.burst, self.tokens + elapsed * self.current_rps)
+            self.last_refill = now
+
+            if self.tokens < 1.0:
+                wait = (1.0 - self.tokens) / self.current_rps
+                _time.sleep(wait)
+                self.tokens = 0.0
+                return wait
+            else:
+                self.tokens -= 1.0
+                return 0.0
+
+    def record_latency(self, latency_ms: float):
+        """Record request latency for adaptive rate adjustment."""
+        with self._lock:
+            self._latencies.append(latency_ms)
+            if len(self._latencies) > self._latency_window:
+                self._latencies = self._latencies[-self._latency_window:]
+
+            if self._baseline_latency is None and len(self._latencies) >= 10:
+                self._baseline_latency = sum(self._latencies[:10]) / 10
+
+            if self._baseline_latency and len(self._latencies) >= 5:
+                recent_avg = sum(self._latencies[-5:]) / 5
+                if recent_avg > 2.0 * self._baseline_latency:
+                    # Backpressure: halve rate
+                    if not self._backpressure_active:
+                        self.current_rps = max(self.max_rps * 0.1, self.current_rps * 0.5)
+                        self._backpressure_active = True
+                        _safe_log(f"  ⚠ {self.name}: backpressure — rate → {self.current_rps:.1f} rps", "warning")
+                elif self._backpressure_active:
+                    # Recovery: +10%
+                    self.current_rps = min(self.max_rps, self.current_rps * 1.1)
+                    if self.current_rps >= self.max_rps * 0.95:
+                        self._backpressure_active = False
+
+    def pause_for_429(self, retry_after: float = 60.0):
+        """Pause this exchange for the specified duration (HTTP 429 handling)."""
+        with self._lock:
+            self._paused_until = _time.monotonic() + retry_after
+            self.current_rps = max(self.max_rps * 0.1, self.current_rps * 0.25)
+            _safe_log(f"  ⛔ {self.name}: HTTP 429 — paused {retry_after:.0f}s, rate → {self.current_rps:.1f} rps", "warning")
+
+    def stats(self) -> dict:
+        avg_lat = sum(self._latencies) / len(self._latencies) if self._latencies else 0
+        return {
+            "exchange": self.name,
+            "current_rps": round(self.current_rps, 2),
+            "max_rps": self.max_rps,
+            "backpressure": self._backpressure_active,
+            "avg_latency_ms": round(avg_lat, 1),
+            "requests_tracked": len(self._latencies),
+        }
+
+
+class _RetryWithCircuitBreaker:
+    """
+    Retry handler with per-exchange circuit breaker.
+
+    - Exponential backoff with full jitter: wait = random(0, 2^attempt)
+    - Circuit breaker: after N consecutive failures → open circuit for M seconds
+    - Tracks success/failure counts per exchange
+    - Specific HTTP error handling: 429 (rate limit), 418 (IP ban), 451 (geo-block)
+    """
+
+    def __init__(self, max_retries: int = 3, cb_threshold: int = 15, cb_cooldown: int = 120):
+        self.max_retries = max_retries
+        self.cb_threshold = cb_threshold
+        self.cb_cooldown = cb_cooldown
+        self._lock = __import__('threading').Lock()
+        self._failures: Dict[str, int] = {}
+        self._successes: Dict[str, int] = {}
+        self._circuit_open_until: Dict[str, float] = {}
+
+    def is_circuit_open(self, exchange: str) -> bool:
+        with self._lock:
+            until = self._circuit_open_until.get(exchange, 0)
+            if _time.monotonic() < until:
+                return True
+            # Auto-close after cooldown
+            if exchange in self._circuit_open_until:
+                del self._circuit_open_until[exchange]
+                self._failures[exchange] = 0
+            return False
+
+    def record_success(self, exchange: str):
+        with self._lock:
+            self._successes[exchange] = self._successes.get(exchange, 0) + 1
+            self._failures[exchange] = 0  # reset consecutive failures
+
+    def record_failure(self, exchange: str):
+        with self._lock:
+            self._failures[exchange] = self._failures.get(exchange, 0) + 1
+            if self._failures[exchange] >= self.cb_threshold:
+                self._circuit_open_until[exchange] = _time.monotonic() + self.cb_cooldown
+                _safe_log(f"  🔴 {exchange}: circuit breaker OPEN ({self._failures[exchange]} failures, "
+                           f"cooldown {self.cb_cooldown}s)", "warning")
+
+    def execute(self, func, *args, exchange_name: str = "unknown",
+                rate_limiter: Optional[_ExchangeRateLimiter] = None, **kwargs):
+        """Execute func with retries, backoff, and circuit breaker."""
+        if self.is_circuit_open(exchange_name):
+            return None
+
+        import random as _random
+        for attempt in range(1, self.max_retries + 1):
+            if rate_limiter:
+                rate_limiter.acquire()
+
+            t0 = _time.monotonic()
+            try:
+                result = func(*args, **kwargs)
+                latency_ms = (_time.monotonic() - t0) * 1000
+                if rate_limiter:
+                    rate_limiter.record_latency(latency_ms)
+                self.record_success(exchange_name)
+                return result
+            except Exception as e:
+                latency_ms = (_time.monotonic() - t0) * 1000
+                if rate_limiter:
+                    rate_limiter.record_latency(latency_ms)
+
+                err_str = str(e).lower()
+                # HTTP 429: rate limited
+                if "429" in err_str or "rate" in err_str:
+                    retry_after = 60.0
+                    if rate_limiter:
+                        rate_limiter.pause_for_429(retry_after)
+                    _time.sleep(retry_after)
+                    continue
+                # HTTP 418: IP ban
+                if "418" in err_str:
+                    self.record_failure(exchange_name)
+                    self.record_failure(exchange_name)  # double-count → faster circuit break
+                    return None
+                # HTTP 451: geo-block
+                if "451" in err_str or "restricted" in err_str:
+                    # Permanent failure — open circuit immediately
+                    with self._lock:
+                        self._failures[exchange_name] = self.cb_threshold
+                        self._circuit_open_until[exchange_name] = _time.monotonic() + 86400  # 24h
+                    return None
+
+                self.record_failure(exchange_name)
+                if attempt < self.max_retries:
+                    wait = _random.uniform(0, min(2 ** attempt, 30))
+                    _time.sleep(wait)
+
+        return None
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {
+                "successes": dict(self._successes),
+                "failures": dict(self._failures),
+                "circuits_open": [k for k, v in self._circuit_open_until.items()
+                                  if _time.monotonic() < v],
+            }
 
 
 # ---------------------------------------------------------------------------
@@ -579,6 +776,14 @@ class UniverseScreener:
         _pool_lock = __import__('threading').Lock()
         _pool_counters: Dict[str, int] = {k: 0 for k in _exchange_pools}
 
+        # Initialize per-exchange rate limiters and shared retry handler
+        _rate_limiters: Dict[str, _ExchangeRateLimiter] = {}
+        for _ename in _exchange_pools:
+            _rate_limiters[_ename] = _ExchangeRateLimiter(_ename, max_rps=8.0, burst=5)
+        _retry_handler = _RetryWithCircuitBreaker(max_retries=3, cb_threshold=15, cb_cooldown=120)
+
+        _safe_log(f"Stage 2: Rate limiters initialized for {len(_rate_limiters)} exchanges")
+
         def _get_exchange(exch_name: str):
             """Round-robin instance from a named exchange pool."""
             instances = _exchange_pools.get(exch_name, [])
@@ -589,19 +794,34 @@ class UniverseScreener:
                 _pool_counters[exch_name] = idx + 1
                 return instances[idx]
 
-        def _fetch_ohlcv_from(ex, pair: str, since_ts_: int) -> List:
-            """Fetch all candles from a single exchange instance."""
+        def _fetch_ohlcv_from(ex, pair: str, since_ts_: int, exch_name: str = "unknown") -> List:
+            """Fetch all candles with rate limiting and retry logic."""
+            rl = _rate_limiters.get(exch_name)
             all_candles = []
             current = since_ts_
+            page = 0
             while True:
-                candles = ex.fetch_ohlcv(pair, timeframe="1d", since=current, limit=1000)
-                if not candles:
+                # Rate limit before each page request
+                if rl:
+                    rl.acquire()
+
+                # Use retry handler for each page
+                def _page_fetch():
+                    return ex.fetch_ohlcv(pair, timeframe="1d", since=current, limit=1000)
+
+                candles = _retry_handler.execute(
+                    _page_fetch,
+                    exchange_name=exch_name,
+                    rate_limiter=rl,
+                )
+                if candles is None or len(candles) == 0:
                     break
                 all_candles.extend(candles)
                 last_ts = candles[-1][0]
                 if last_ts <= current:
                     break
                 current = last_ts + 1
+                page += 1
             return all_candles
 
         # ── Advanced Parallel Cascade: race ALL exchanges simultaneously per asset ──
@@ -612,14 +832,17 @@ class UniverseScreener:
         # slow/failed exchanges before trying the next one.
 
         def _try_exchange_for_symbol(exch_name: str, sym: str) -> Optional[pd.DataFrame]:
-            """Attempt to fetch OHLCV for sym from a single exchange. Returns df or None."""
+            """Attempt to fetch OHLCV for sym from a single exchange with rate limiting."""
+            # Skip if circuit breaker is open for this exchange
+            if _retry_handler.is_circuit_open(exch_name):
+                return None
             ex = _get_exchange(exch_name)
             if ex is None:
                 return None
             for quote in ["USDT", "USD"]:
                 pair = f"{sym}/{quote}"
                 try:
-                    candles = _fetch_ohlcv_from(ex, pair, since_ts)
+                    candles = _fetch_ohlcv_from(ex, pair, since_ts, exch_name=exch_name)
                     if candles and len(candles) >= 30:  # at least 30 daily candles
                         df = pd.DataFrame(
                             candles,
@@ -690,6 +913,19 @@ class UniverseScreener:
         self.ohlcv_data = data
         _safe_log(f"Stage 2: Fetched {succeeded} assets, {failed} failed, "
                    f"{cached_count} from cache -> {len(data)} total")
+
+        # Log rate limiter and retry handler statistics
+        _safe_log("Stage 2: Rate limiter stats:")
+        for _rl_name, _rl in _rate_limiters.items():
+            s = _rl.stats()
+            _safe_log(f"  {s['exchange']}: {s['current_rps']:.1f} rps, "
+                       f"avg latency {s['avg_latency_ms']:.0f}ms, "
+                       f"backpressure={'YES' if s['backpressure'] else 'no'}")
+        _rh_stats = _retry_handler.stats()
+        if _rh_stats["circuits_open"]:
+            _safe_log(f"Stage 2: Circuit breakers open: {_rh_stats['circuits_open']}", "warning")
+        _safe_log(f"Stage 2: Retry handler — successes: {sum(_rh_stats['successes'].values())}, "
+                   f"failures: {sum(_rh_stats['failures'].values())}")
 
         return data
 
