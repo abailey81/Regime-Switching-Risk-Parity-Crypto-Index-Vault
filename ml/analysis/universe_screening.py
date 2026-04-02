@@ -740,7 +740,7 @@ class UniverseScreener:
             _exchange_order.remove(_primary)
         _exchange_order.insert(0, _primary)
 
-        _n_workers = min(20, len(symbols_to_fetch))
+        _n_workers = min(8, len(symbols_to_fetch))  # 8 outer × ~3 inner = ~24 connections (safe)
         _exchange_pools: Dict[str, List] = {}
         _safe_log(f"Stage 2: Creating {_n_workers} worker connections across "
                    f"{len(_exchange_order)} authenticated exchanges...")
@@ -779,8 +779,8 @@ class UniverseScreener:
         # Initialize per-exchange rate limiters and shared retry handler
         _rate_limiters: Dict[str, _ExchangeRateLimiter] = {}
         for _ename in _exchange_pools:
-            _rate_limiters[_ename] = _ExchangeRateLimiter(_ename, max_rps=8.0, burst=5)
-        _retry_handler = _RetryWithCircuitBreaker(max_retries=3, cb_threshold=15, cb_cooldown=120)
+            _rate_limiters[_ename] = _ExchangeRateLimiter(_ename, max_rps=5.0, burst=3)
+        _retry_handler = _RetryWithCircuitBreaker(max_retries=2, cb_threshold=10, cb_cooldown=60)
 
         _safe_log(f"Stage 2: Rate limiters initialized for {len(_rate_limiters)} exchanges")
 
@@ -864,10 +864,16 @@ class UniverseScreener:
             """
             from concurrent.futures import ThreadPoolExecutor as _InnerPool, as_completed as _ac
 
-            with _InnerPool(max_workers=len(_exchange_order)) as race_pool:
+            # Race top 3 non-circuit-broken exchanges (limits total connections)
+            _active_exchanges = [e for e in _exchange_order
+                                  if not _retry_handler.is_circuit_open(e)][:3]
+            if not _active_exchanges:
+                _active_exchanges = _exchange_order[:2]  # fallback
+
+            with _InnerPool(max_workers=len(_active_exchanges)) as race_pool:
                 race_futures = {
                     race_pool.submit(_try_exchange_for_symbol, ename, sym): ename
-                    for ename in _exchange_order
+                    for ename in _active_exchanges
                 }
                 for fut in _ac(race_futures):
                     result = fut.result()
