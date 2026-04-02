@@ -218,6 +218,36 @@ class RebalancingCostModel:
                                                asset_names, portfolio_value)
         return result["total_cost_bps"]
 
+    def compute_rebalance_cost(
+        self,
+        old_weights: np.ndarray,
+        new_weights: np.ndarray,
+        asset_names: list,
+        portfolio_value_usd: float = 1_000_000,
+        volatility_regime: str = "normal",
+    ) -> float:
+        """
+        Compute total rebalancing cost in bps.
+
+        Convenience wrapper that returns just the scalar bps cost,
+        suitable for direct use in the backtest loop.
+
+        Args:
+            old_weights: Previous portfolio weights
+            new_weights: Target portfolio weights
+            asset_names: List of asset name strings
+            portfolio_value_usd: Portfolio NAV in USD
+            volatility_regime: One of 'calm', 'normal', 'volatile', 'crisis'
+
+        Returns:
+            Total cost in basis points (float)
+        """
+        result = self.estimate_rebalance_cost(
+            old_weights, new_weights, asset_names,
+            portfolio_value_usd, volatility_regime,
+        )
+        return result["total_cost_bps"]
+
     def cost_sensitivity_analysis(self, old_w, new_w, names, pv=1e6):
         """Run across all volatility regimes."""
         return {r: self.estimate_rebalance_cost(old_w, new_w, names, pv, r)["total_cost_bps"]

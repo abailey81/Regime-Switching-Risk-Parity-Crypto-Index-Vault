@@ -5,12 +5,15 @@ Protocol:
   - Train window: 180 days (4320 hours), Test window: 30 days (720 hours)
   - Roll forward by 30 days, refit GARCH-DCC and HMM each fold
   - SAC RL uses pre-trained model (inference only, no retraining)
-  - Transaction costs: 10 bps per unit of turnover
-  - Compare against 4 benchmarks
+  - Transaction costs: venue-specific via RebalancingCostModel
+  - Compare against 6 benchmarks
 
 Outputs:
-  - Performance metrics (Sharpe, CVaR, MDD, etc.)
+  - Performance metrics (Sharpe, CVaR, MDD, etc.) with bootstrap CIs
   - Equity curves, drawdown plots, regime timeline, weight evolution
+  - Monthly returns heatmap, 4-panel risk dashboard
+  - Rolling Sharpe comparison
+  - Statistical significance tests vs benchmarks
 """
 import logging
 import json
@@ -22,19 +25,44 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
 from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 
 from ..models.garch_dcc import StudentTGarchDCC
 from ..models.bayesian_hmm import BayesianRegimeHMM
 from ..models.ensemble import EnsembleCombiner
 from ..data.preprocess import prepare_hmm_features
 from .benchmarks import run_all_benchmarks
-from .metrics import compute_all_metrics, format_metrics_table
+from .metrics import (
+    compute_all_metrics, format_metrics_table,
+    bootstrap_metric, paired_bootstrap_test,
+    sharpe_ratio, maximum_drawdown, cvar, drawdown_series,
+)
+from .transaction_costs import RebalancingCostModel
 
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════
-#              VISUALISATION HELPERS
+#              PUBLICATION-QUALITY STYLE
 # ═══════════════════════════════════════════════════
+
+def _set_plot_style():
+    """Configure matplotlib/seaborn for publication-quality charts."""
+    sns.set_style("whitegrid")
+    plt.rcParams.update({
+        "font.family": "sans-serif",
+        "font.size": 11,
+        "axes.titlesize": 14,
+        "axes.titleweight": "bold",
+        "axes.labelsize": 12,
+        "legend.fontsize": 10,
+        "figure.dpi": 150,
+        "savefig.dpi": 300,
+        "savefig.bbox": "tight",
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+    })
+
+_set_plot_style()
 
 COLOURS = {
     "ensemble": "#1f77b4",
@@ -42,13 +70,151 @@ COLOURS = {
     "btc_only": "#2ca02c",
     "sixty_forty": "#d62728",
     "market_cap": "#9467bd",
+    "risk_parity_static": "#8c564b",
+    "min_variance": "#e377c2",
 }
 
 REGIME_COLOURS = {"bull": "#27ae60", "normal": "#f39c12", "crisis": "#e74c3c"}
 
 
-def plot_equity_curves(ensemble_equity, benchmark_results, timestamps, output_dir):
-    """Plot overlaid equity curves for all strategies."""
+# ═══════════════════════════════════════════════════
+#              SAC OBSERVATION BUILDER
+# ═══════════════════════════════════════════════════
+
+def _build_sac_observation(
+    returns_df: pd.DataFrame,
+    features_df: pd.DataFrame,
+    hmm_features: pd.DataFrame,
+    regime_probs: np.ndarray,
+    t: int,
+    n_assets: int,
+    cumulative_return: float,
+    drawdown: float,
+    steps_since_rebalance: int,
+    return_history: List[float],
+    config: dict,
+) -> np.ndarray:
+    """
+    Build a proper observation vector for the SAC agent from real data.
+
+    Matches the PortfolioEnv state space (dim=48):
+      [0..23]   Per-asset features: returns_5d, returns_20d, vol_20d  (n_assets * 3)
+      [24..31]  GARCH vol forecasts (approx from rolling vol)         (n_assets)
+      [32..39]  Rolling correlation with BTC                          (n_assets)
+      [40..42]  HMM regime probabilities                              (3)
+      [43]      Regime transition probability                         (1)
+      [44]      Cumulative return                                     (1)
+      [45]      Current drawdown                                      (1)
+      [46]      Days since rebalance                                  (1)
+      [47]      Current Kelly fraction                                (1)
+
+    Args:
+        returns_df: Full returns DataFrame
+        features_df: Full feature DataFrame (may be MultiIndex)
+        hmm_features: HMM feature DataFrame
+        regime_probs: Current HMM regime probabilities (3,)
+        t: Current global time index into returns_df
+        n_assets: Number of assets
+        cumulative_return: Portfolio cumulative return
+        drawdown: Current drawdown from high-water mark
+        steps_since_rebalance: Steps since last rebalance
+        return_history: List of recent portfolio returns
+        config: Full config dict
+
+    Returns:
+        obs: np.ndarray of shape (48,) or (state_dim,)
+    """
+    rl_cfg = config.get("rl", {})
+    state_dim = rl_cfg.get("state_dim", 48)
+    btc_corr_lookback = rl_cfg.get("btc_corr_lookback", 168)
+
+    asset_names = list(returns_df.columns)
+
+    # ── Per-asset features: returns_5d, returns_20d, vol_20d ──
+    asset_features = np.zeros(n_assets * 3)
+    if t >= 480:
+        for i, col in enumerate(asset_names):
+            # 5d returns (120h)
+            r5d = returns_df.iloc[max(0, t-120):t][col].sum()
+            # 20d returns (480h)
+            r20d = returns_df.iloc[max(0, t-480):t][col].sum()
+            # 20d volatility
+            v20d = returns_df.iloc[max(0, t-480):t][col].std() * np.sqrt(8760)
+
+            asset_features[i] = r5d
+            asset_features[n_assets + i] = r20d
+            asset_features[2 * n_assets + i] = v20d
+
+    # ── GARCH vol proxies (use rolling 20d vol as approximation) ──
+    garch_feat = np.zeros(n_assets)
+    if t >= 480:
+        for i, col in enumerate(asset_names):
+            garch_feat[i] = returns_df.iloc[max(0, t-480):t][col].std() * np.sqrt(8760)
+
+    # ── Rolling BTC correlation ──
+    btc_corr = np.zeros(n_assets)
+    if t >= btc_corr_lookback and "BTC" in asset_names:
+        btc_idx = asset_names.index("BTC")
+        window = returns_df.iloc[t - btc_corr_lookback:t]
+        btc_rets = window.iloc[:, btc_idx].values
+        btc_std = btc_rets.std()
+        if btc_std > 1e-10:
+            for i in range(n_assets):
+                asset_rets = window.iloc[:, i].values
+                if asset_rets.std() > 1e-10:
+                    btc_corr[i] = np.corrcoef(btc_rets, asset_rets)[0, 1]
+
+    # ── Regime transition probability (entropy-based) ──
+    probs = np.clip(regime_probs, 1e-10, 1.0)
+    entropy = -np.sum(probs * np.log(probs))
+    max_entropy = np.log(len(probs))
+    transition_prob = entropy / max_entropy if max_entropy > 0 else 0.0
+
+    # ── Kelly fraction estimate ──
+    kelly_frac = 0.5
+    if len(return_history) >= 50:
+        recent = np.array(return_history[-480:])
+        mu = recent.mean()
+        var = recent.var()
+        if var > 1e-12:
+            kelly_frac = float(np.clip(mu / var, 0.0, 1.0))
+
+    # ── Portfolio state ──
+    portfolio_state = np.array([
+        cumulative_return,
+        drawdown,
+        steps_since_rebalance / 24.0,  # Normalise to days
+        kelly_frac,
+    ])
+
+    obs = np.concatenate([
+        asset_features,       # n_assets * 3
+        garch_feat,           # n_assets
+        btc_corr,             # n_assets
+        regime_probs,         # 3
+        [transition_prob],    # 1
+        portfolio_state,      # 4
+    ]).astype(np.float32)
+
+    # Pad or truncate to expected dimension
+    if len(obs) < state_dim:
+        obs = np.pad(obs, (0, state_dim - len(obs)))
+    elif len(obs) > state_dim:
+        obs = obs[:state_dim]
+
+    # Replace NaN/inf
+    obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return obs
+
+
+# ═══════════════════════════════════════════════════
+#              VISUALISATION HELPERS
+# ═══════════════════════════════════════════════════
+
+def plot_equity_curves(ensemble_equity: np.ndarray, benchmark_results: dict,
+                       timestamps: pd.DatetimeIndex, output_dir: Path) -> None:
+    """Plot overlaid equity curves for all strategies (log-scale)."""
     fig, ax = plt.subplots(figsize=(14, 7))
 
     ax.plot(timestamps, ensemble_equity, label="Ensemble (Ours)",
@@ -63,19 +229,18 @@ def plot_equity_curves(ensemble_equity, benchmark_results, timestamps, output_di
     ax.set_xlabel("Date", fontsize=12)
     ax.set_ylabel("Portfolio Value ($1 invested)", fontsize=12)
     ax.set_title("Walk-Forward Backtest: Equity Curves", fontsize=14, fontweight="bold")
-    ax.legend(loc="upper left", fontsize=10)
+    ax.legend(loc="upper left", fontsize=9)
     ax.set_yscale("log")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(output_dir / "equity_curves.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
-    logger.info(f"  Saved equity_curves.png")
+    logger.info("  Saved equity_curves.png")
 
 
-def plot_drawdowns(ensemble_returns, benchmark_results, timestamps, output_dir):
+def plot_drawdowns(ensemble_returns: np.ndarray, benchmark_results: dict,
+                   timestamps: pd.DatetimeIndex, output_dir: Path) -> None:
     """Plot drawdown time series."""
-    from .metrics import drawdown_series
-
     fig, ax = plt.subplots(figsize=(14, 5))
 
     dd = drawdown_series(ensemble_returns)
@@ -96,11 +261,12 @@ def plot_drawdowns(ensemble_returns, benchmark_results, timestamps, output_dir):
     fig.tight_layout()
     fig.savefig(output_dir / "drawdown_plot.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
-    logger.info(f"  Saved drawdown_plot.png")
+    logger.info("  Saved drawdown_plot.png")
 
 
-def plot_regime_timeline(regimes, timestamps, output_dir):
-    """Plot regime classification over time."""
+def plot_regime_timeline(regimes: list, timestamps: pd.DatetimeIndex,
+                         output_dir: Path) -> None:
+    """Plot regime classification over time (color-coded)."""
     fig, ax = plt.subplots(figsize=(14, 2.5))
 
     for i, (regime, colour) in enumerate(REGIME_COLOURS.items()):
@@ -124,10 +290,11 @@ def plot_regime_timeline(regimes, timestamps, output_dir):
     fig.tight_layout()
     fig.savefig(output_dir / "regime_timeline.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
-    logger.info(f"  Saved regime_timeline.png")
+    logger.info("  Saved regime_timeline.png")
 
 
-def plot_weight_evolution(weights_history, asset_names, timestamps, output_dir):
+def plot_weight_evolution(weights_history: list, asset_names: list,
+                          timestamps: pd.DatetimeIndex, output_dir: Path) -> None:
     """Stacked area chart of portfolio weights over time."""
     fig, ax = plt.subplots(figsize=(14, 6))
 
@@ -144,11 +311,12 @@ def plot_weight_evolution(weights_history, asset_names, timestamps, output_dir):
     fig.tight_layout()
     fig.savefig(output_dir / "weight_evolution.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
-    logger.info(f"  Saved weight_evolution.png")
+    logger.info("  Saved weight_evolution.png")
 
 
-def plot_rolling_sharpe(ensemble_returns, benchmark_results, timestamps,
-                        output_dir, window=2160):
+def plot_rolling_sharpe(ensemble_returns: np.ndarray, benchmark_results: dict,
+                        timestamps: pd.DatetimeIndex, output_dir: Path,
+                        window: int = 2160) -> None:
     """Rolling 90-day Sharpe ratio."""
     fig, ax = plt.subplots(figsize=(14, 5))
 
@@ -176,7 +344,132 @@ def plot_rolling_sharpe(ensemble_returns, benchmark_results, timestamps,
     fig.tight_layout()
     fig.savefig(output_dir / "rolling_sharpe.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
-    logger.info(f"  Saved rolling_sharpe.png")
+    logger.info("  Saved rolling_sharpe.png")
+
+
+def plot_monthly_returns_heatmap(returns: np.ndarray, timestamps: pd.DatetimeIndex,
+                                  output_dir: Path) -> None:
+    """
+    Monthly returns heatmap -- rows=years, columns=months.
+    """
+    import calendar
+    returns_series = pd.Series(returns, index=timestamps)
+
+    # Resample to monthly returns
+    monthly = returns_series.resample("M").sum()
+    monthly_pct = (np.exp(monthly) - 1) * 100  # Convert to percentage
+
+    # Pivot to year x month
+    df = pd.DataFrame({
+        "year": monthly_pct.index.year,
+        "month": monthly_pct.index.month,
+        "return": monthly_pct.values,
+    })
+    pivot = df.pivot_table(values="return", index="year", columns="month", aggfunc="first")
+    pivot.columns = [calendar.month_abbr[m] for m in pivot.columns]
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    sns.heatmap(pivot, annot=True, fmt=".1f", cmap="RdYlGn", center=0,
+                linewidths=0.5, ax=ax, cbar_kws={"label": "Monthly Return (%)"})
+    ax.set_title("Monthly Returns Heatmap (%)", fontsize=14, fontweight="bold")
+    ax.set_ylabel("Year")
+    fig.tight_layout()
+    fig.savefig(output_dir / "monthly_returns_heatmap.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("  Saved monthly_returns_heatmap.png")
+
+
+def plot_risk_metrics_dashboard(returns: np.ndarray, timestamps: pd.DatetimeIndex,
+                                 output_dir: Path) -> None:
+    """
+    4-panel risk dashboard: rolling vol, rolling CVaR, drawdown, VaR histogram.
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    n = min(len(returns), len(timestamps))
+    returns_s = pd.Series(returns[:n], index=timestamps[:n])
+
+    # 1. Rolling 30-day volatility
+    rolling_vol = returns_s.rolling(720).std() * np.sqrt(8760) * 100
+    axes[0, 0].plot(timestamps[:n], rolling_vol, color="#e74c3c", linewidth=1)
+    axes[0, 0].set_title("Rolling 30-Day Volatility (%)", fontweight="bold")
+    axes[0, 0].set_ylabel("Annualised Vol (%)")
+    axes[0, 0].grid(True, alpha=0.3)
+
+    # 2. Rolling 30-day CVaR
+    cvar_values = []
+    for i in range(720, n):
+        from .metrics import cvar as compute_cvar
+        cv = compute_cvar(returns[i-720:i], 0.05) * 100
+        cvar_values.append(cv)
+    if cvar_values:
+        axes[0, 1].plot(timestamps[720:n], cvar_values, color="#8e44ad", linewidth=1)
+    axes[0, 1].set_title("Rolling 30-Day CVaR 5% (%)", fontweight="bold")
+    axes[0, 1].set_ylabel("CVaR (%)")
+    axes[0, 1].grid(True, alpha=0.3)
+
+    # 3. Drawdown
+    dd = drawdown_series(returns[:n])
+    axes[1, 0].fill_between(timestamps[:n], dd * 100, 0, alpha=0.5, color="#e74c3c")
+    axes[1, 0].set_title("Drawdown (%)", fontweight="bold")
+    axes[1, 0].set_ylabel("Drawdown (%)")
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # 4. Return distribution with VaR
+    axes[1, 1].hist(returns[:n] * 100, bins=100, color="#3498db", alpha=0.7, edgecolor="white")
+    var_5 = np.percentile(returns[:n], 5) * 100
+    axes[1, 1].axvline(var_5, color="red", linewidth=2, linestyle="--", label=f"VaR 5%: {var_5:.2f}%")
+    axes[1, 1].set_title("Return Distribution with VaR", fontweight="bold")
+    axes[1, 1].set_xlabel("Hourly Return (%)")
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3)
+
+    fig.suptitle("Risk Metrics Dashboard", fontsize=16, fontweight="bold", y=1.01)
+    fig.tight_layout()
+    fig.savefig(output_dir / "risk_dashboard.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("  Saved risk_dashboard.png")
+
+
+# ═══════════════════════════════════════════════════
+#          BOOTSTRAP & SIGNIFICANCE TESTING
+# ═══════════════════════════════════════════════════
+
+def _compute_bootstrap_cis(returns: np.ndarray, n_resamples: int = 1000) -> dict:
+    """Compute bootstrap 95% CIs for key metrics."""
+    ci_sharpe = bootstrap_metric(returns, sharpe_ratio, n_resamples=n_resamples)
+    ci_mdd = bootstrap_metric(returns, maximum_drawdown, n_resamples=n_resamples)
+    ci_cvar = bootstrap_metric(
+        returns,
+        lambda r: cvar(r, 0.05),
+        n_resamples=n_resamples,
+    )
+
+    return {
+        "sharpe_ci": ci_sharpe,
+        "max_drawdown_ci": ci_mdd,
+        "cvar_5pct_ci": ci_cvar,
+    }
+
+
+def _compute_significance_tests(
+    ensemble_returns: np.ndarray,
+    benchmark_results: dict,
+    n_resamples: int = 1000,
+) -> dict:
+    """
+    Paired bootstrap test: is ensemble Sharpe significantly > each benchmark?
+    Returns p-values for each benchmark.
+    """
+    results = {}
+    for key, bm in benchmark_results.items():
+        test = paired_bootstrap_test(
+            ensemble_returns, bm["returns"],
+            metric_func=sharpe_ratio,
+            n_resamples=n_resamples,
+        )
+        results[bm["name"]] = test
+    return results
 
 
 # ═══════════════════════════════════════════════════
@@ -196,7 +489,7 @@ def run_walk_forward(
         1. Train GARCH-DCC on [t, t+train_window]
         2. Train HMM on [t, t+train_window]
         3. Generate weights for [t+train_window, t+train_window+test_window]
-        4. Simulate portfolio returns with transaction costs
+        4. Simulate portfolio returns with venue-specific transaction costs
         5. Roll forward by test_window
 
     Returns:
@@ -212,7 +505,11 @@ def run_walk_forward(
     test_window = bt_cfg.get("test_window", 720)
     step_size = bt_cfg.get("step_size", 720)
     tc_bps = bt_cfg.get("transaction_cost_bps", 10)
-    tc_rate = tc_bps / 10000
+    bootstrap_n = bt_cfg.get("bootstrap_resamples", 1000)
+
+    # Venue-specific cost model
+    cost_model = RebalancingCostModel()
+    portfolio_value_usd = bt_cfg.get("portfolio_value_usd", 1_000_000)
 
     # Load data
     from ..data.preprocess import prepare_all_data
@@ -236,16 +533,18 @@ def run_walk_forward(
     # ── Walk-Forward Loop ──
     ensemble = EnsembleCombiner(config=config, asset_names=asset_names)
 
-    all_returns = []
-    all_weights = []
-    all_regimes = []
-    all_weight_changes = []
-    fold_metrics = []
-    timestamps = []
+    all_returns: List[float] = []
+    all_weights: List[np.ndarray] = []
+    all_regimes: List[str] = []
+    all_weight_changes: List[np.ndarray] = []
+    fold_metrics: List[dict] = []
+    timestamps: List = []
 
     t = 0
     fold = 0
     current_weights = np.ones(n_assets) / n_assets
+    cumulative_return = 0.0
+    high_water_mark = 1.0
 
     while t + train_window + test_window <= n_total:
         fold += 1
@@ -287,6 +586,8 @@ def run_walk_forward(
         test_timestamps = returns_df.index[test_start:test_end]
 
         for i in range(len(test_returns)):
+            global_t = test_start + i
+
             # Get HMM regime probs
             try:
                 if i < len(test_hmm_feat):
@@ -295,12 +596,24 @@ def run_walk_forward(
                     ).values[0]
                 else:
                     regime_probs = np.array([0.33, 0.34, 0.33])
-            except:
+            except Exception:
                 regime_probs = np.array([0.33, 0.34, 0.33])
 
-            # Get RL weights (if available)
+            # Get RL weights (if available) — FIXED: build real observations
             if sac_agent:
-                obs = np.zeros(38, dtype=np.float32)
+                obs = _build_sac_observation(
+                    returns_df=returns_df,
+                    features_df=features_df,
+                    hmm_features=hmm_features,
+                    regime_probs=regime_probs,
+                    t=global_t,
+                    n_assets=n_assets,
+                    cumulative_return=cumulative_return,
+                    drawdown=1.0 - np.exp(sum(all_returns)) / high_water_mark if all_returns else 0.0,
+                    steps_since_rebalance=i,
+                    return_history=all_returns[-480:] if all_returns else [],
+                    config=config,
+                )
                 rl_weights = sac_agent.predict(obs)
                 rl_uncertainty = sac_agent.get_uncertainty()
             else:
@@ -324,12 +637,27 @@ def run_walk_forward(
             new_weights = result["weights"]
             regime = result["regime"]
 
-            # Transaction cost
-            turnover = np.abs(new_weights - current_weights).sum()
-            tc = turnover * tc_rate
+            # ── Venue-specific transaction costs ──
+            # Map regime to volatility regime label for cost model
+            vol_regime_map = {"bull": "calm", "normal": "normal", "crisis": "volatile"}
+            vol_regime = vol_regime_map.get(regime, "normal")
+            tc_cost_bps = cost_model.compute_rebalance_cost(
+                old_weights=current_weights,
+                new_weights=new_weights,
+                asset_names=asset_names,
+                portfolio_value_usd=portfolio_value_usd * nav,
+                volatility_regime=vol_regime,
+            )
+            tc = tc_cost_bps / 10000  # Convert bps to decimal
 
             # Portfolio return
             period_return = np.dot(new_weights, test_returns[i]) - tc
+
+            # Update tracking
+            cumulative_return += period_return
+            current_nav = np.exp(cumulative_return)
+            if current_nav > high_water_mark:
+                high_water_mark = current_nav
 
             # Record
             all_returns.append(period_return)
@@ -351,7 +679,6 @@ def run_walk_forward(
 
     # ── Run Benchmarks ──
     logger.info("\nRunning benchmarks...")
-    # Use same test period as ensemble
     test_start_global = train_window
     test_returns_df = returns_df.iloc[test_start_global:test_start_global + len(all_returns)]
     benchmark_results = run_all_benchmarks(test_returns_df, asset_names, tc_bps)
@@ -370,6 +697,22 @@ def run_walk_forward(
         bm = compute_all_metrics(result["returns"])
         all_metrics[result["name"]] = bm
 
+    # ── Bootstrap Confidence Intervals ──
+    logger.info("\nComputing bootstrap confidence intervals...")
+    bootstrap_cis = _compute_bootstrap_cis(all_returns, n_resamples=bootstrap_n)
+
+    # Add CIs to ensemble metrics
+    for metric_key, ci_data in bootstrap_cis.items():
+        base_key = metric_key.replace("_ci", "")
+        ensemble_metrics[f"{base_key}_ci_lower"] = ci_data["ci_lower"]
+        ensemble_metrics[f"{base_key}_ci_upper"] = ci_data["ci_upper"]
+
+    # ── Statistical Significance Tests ──
+    logger.info("Computing significance tests (paired bootstrap)...")
+    significance_results = _compute_significance_tests(
+        all_returns, benchmark_results, n_resamples=bootstrap_n,
+    )
+
     # ── Display Metrics ──
     metrics_df = pd.DataFrame(all_metrics).T
     logger.info(f"\n{'='*60}")
@@ -377,7 +720,24 @@ def run_walk_forward(
     logger.info(f"{'='*60}")
     logger.info(f"\n{metrics_df.round(4).to_string()}")
 
-    # ── Generate Charts ──
+    # Display bootstrap CIs
+    logger.info(f"\n{'='*60}")
+    logger.info(f"  BOOTSTRAP 95% CONFIDENCE INTERVALS")
+    logger.info(f"{'='*60}")
+    for metric_key, ci_data in bootstrap_cis.items():
+        logger.info(f"  {metric_key}: {ci_data['point_estimate']:.4f} "
+                    f"[{ci_data['ci_lower']:.4f}, {ci_data['ci_upper']:.4f}]")
+
+    # Display significance tests
+    logger.info(f"\n{'='*60}")
+    logger.info(f"  SIGNIFICANCE TESTS (Ensemble Sharpe > Benchmark)")
+    logger.info(f"{'='*60}")
+    for name, test_res in significance_results.items():
+        sig_marker = "*" if test_res["significant_5pct"] else ""
+        logger.info(f"  vs {name}: diff={test_res['diff']:.4f}, "
+                    f"p={test_res['p_value']:.4f}{sig_marker}")
+
+    # ── Generate All 9 Charts ──
     output_dir = Path("results")
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -387,10 +747,25 @@ def run_walk_forward(
     plot_regime_timeline(all_regimes, timestamps, output_dir)
     plot_weight_evolution(all_weights, asset_names, timestamps, output_dir)
     plot_rolling_sharpe(all_returns, benchmark_results, timestamps, output_dir)
+    plot_monthly_returns_heatmap(all_returns, timestamps, output_dir)
+    plot_risk_metrics_dashboard(all_returns, timestamps, output_dir)
+    # monte_carlo_fan_6m.png and monte_carlo_fan_12m.png are generated
+    # by monte_carlo.py when called separately
 
-    # ── Save Metrics ──
+    # ── Save Metrics CSV with CIs ──
+    # Add significance column
+    sig_df = pd.DataFrame(significance_results).T
+    if not sig_df.empty:
+        sig_df.to_csv(output_dir / "significance_tests.csv")
+        logger.info("  Saved significance_tests.csv")
+
+    # Save bootstrap CIs
+    ci_df = pd.DataFrame(bootstrap_cis).T
+    ci_df.to_csv(output_dir / "bootstrap_confidence_intervals.csv")
+    logger.info("  Saved bootstrap_confidence_intervals.csv")
+
     metrics_df.to_csv(output_dir / "performance_summary.csv")
-    logger.info(f"  Saved performance_summary.csv")
+    logger.info("  Saved performance_summary.csv")
 
     # ── Save Full Results ──
     results = {
@@ -401,6 +776,8 @@ def run_walk_forward(
         "weights_history": all_weights,
         "metrics": all_metrics,
         "benchmark_results": benchmark_results,
+        "bootstrap_cis": bootstrap_cis,
+        "significance_tests": significance_results,
         "n_folds": fold,
         "config": config,
     }
@@ -423,91 +800,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     results = run_walk_forward(args.config, use_rl=args.rl, rl_model_path=args.rl_model)
-
-
-# ═══════════════════════════════════════════════════════════════
-# ADDITIONAL VISUALISATIONS (from stat-arb backtesting/visualization.py)
-# ═══════════════════════════════════════════════════════════════
-
-def plot_monthly_returns_heatmap(returns, timestamps, output_dir):
-    """
-    Monthly returns heatmap — rows=years, columns=months.
-    Adapted from stat-arb backtesting/visualization.py plot_monthly_returns_heatmap.
-    """
-    import calendar
-    returns_series = pd.Series(returns, index=timestamps)
-
-    # Resample to monthly returns
-    monthly = returns_series.resample("M").sum()
-    monthly_pct = (np.exp(monthly) - 1) * 100  # Convert to percentage
-
-    # Pivot to year x month
-    df = pd.DataFrame({
-        "year": monthly_pct.index.year,
-        "month": monthly_pct.index.month,
-        "return": monthly_pct.values,
-    })
-    pivot = df.pivot_table(values="return", index="year", columns="month", aggfunc="first")
-    pivot.columns = [calendar.month_abbr[m] for m in pivot.columns]
-
-    fig, ax = plt.subplots(figsize=(12, 4))
-    sns.heatmap(pivot, annot=True, fmt=".1f", cmap="RdYlGn", center=0,
-                linewidths=0.5, ax=ax, cbar_kws={"label": "Monthly Return (%)"})
-    ax.set_title("Monthly Returns Heatmap (%)", fontsize=14, fontweight="bold")
-    ax.set_ylabel("Year")
-    fig.tight_layout()
-    fig.savefig(output_dir / "monthly_returns_heatmap.png", dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    logger.info(f"  Saved monthly_returns_heatmap.png")
-
-
-def plot_risk_metrics_dashboard(returns, timestamps, output_dir):
-    """
-    Risk metrics dashboard — 4 subplots: rolling vol, rolling CVaR, drawdown, VaR histogram.
-    Adapted from stat-arb backtesting/visualization.py plot_risk_metrics_dashboard.
-    """
-    from .metrics import drawdown_series, cvar as compute_cvar
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-
-    n = min(len(returns), len(timestamps))
-    returns_s = pd.Series(returns[:n], index=timestamps[:n])
-
-    # 1. Rolling 30-day volatility
-    rolling_vol = returns_s.rolling(720).std() * np.sqrt(8760) * 100
-    axes[0, 0].plot(timestamps[:n], rolling_vol, color="#e74c3c", linewidth=1)
-    axes[0, 0].set_title("Rolling 30-Day Volatility (%)", fontweight="bold")
-    axes[0, 0].set_ylabel("Annualised Vol (%)")
-    axes[0, 0].grid(True, alpha=0.3)
-
-    # 2. Rolling 30-day CVaR
-    cvar_values = []
-    for i in range(720, n):
-        cv = compute_cvar(returns[i-720:i], 0.05) * 100
-        cvar_values.append(cv)
-    axes[0, 1].plot(timestamps[720:n], cvar_values, color="#8e44ad", linewidth=1)
-    axes[0, 1].set_title("Rolling 30-Day CVaR 5% (%)", fontweight="bold")
-    axes[0, 1].set_ylabel("CVaR (%)")
-    axes[0, 1].grid(True, alpha=0.3)
-
-    # 3. Drawdown
-    dd = drawdown_series(returns[:n])
-    axes[1, 0].fill_between(timestamps[:n], dd * 100, 0, alpha=0.5, color="#e74c3c")
-    axes[1, 0].set_title("Drawdown (%)", fontweight="bold")
-    axes[1, 0].set_ylabel("Drawdown (%)")
-    axes[1, 0].grid(True, alpha=0.3)
-
-    # 4. Return distribution with VaR
-    axes[1, 1].hist(returns[:n] * 100, bins=100, color="#3498db", alpha=0.7, edgecolor="white")
-    var_5 = np.percentile(returns[:n], 5) * 100
-    axes[1, 1].axvline(var_5, color="red", linewidth=2, linestyle="--", label=f"VaR 5%: {var_5:.2f}%")
-    axes[1, 1].set_title("Return Distribution with VaR", fontweight="bold")
-    axes[1, 1].set_xlabel("Hourly Return (%)")
-    axes[1, 1].legend()
-    axes[1, 1].grid(True, alpha=0.3)
-
-    fig.suptitle("Risk Metrics Dashboard", fontsize=16, fontweight="bold", y=1.01)
-    fig.tight_layout()
-    fig.savefig(output_dir / "risk_dashboard.png", dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    logger.info(f"  Saved risk_dashboard.png")

@@ -10,7 +10,14 @@ All 14 major crypto crisis events from 2020-2024, used for:
 
 Each event includes: dates, type, severity, BTC drawdown, and expected
 portfolio behaviour under the ensemble strategy.
+
+Severity classification (based on BTC drawdown):
+  - mild:     BTC drawdown < 15%
+  - moderate: BTC drawdown 15-30%
+  - severe:   BTC drawdown > 30%
 """
+import numpy as np
+import pandas as pd
 from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Optional
@@ -28,6 +35,29 @@ class CrisisEvent:
     description: str
     expected_hmm_regime: str  # What HMM should detect
     expected_ensemble_action: str  # What the ensemble should do
+
+    @property
+    def severity_label(self) -> str:
+        """Classify severity as mild/moderate/severe based on BTC drawdown."""
+        dd = abs(self.btc_drawdown_pct)
+        if dd < 15:
+            return "mild"
+        elif dd < 30:
+            return "moderate"
+        else:
+            return "severe"
+
+    @property
+    def start_dt(self) -> datetime:
+        return datetime.strptime(self.start, "%Y-%m-%d")
+
+    @property
+    def end_dt(self) -> datetime:
+        return datetime.strptime(self.end, "%Y-%m-%d")
+
+    @property
+    def duration_days(self) -> int:
+        return (self.end_dt - self.start_dt).days
 
 
 # All 14 major crypto crises (from stat-arb walk_forward_optimizer.py)
@@ -143,29 +173,63 @@ CRYPTO_CRISES: List[CrisisEvent] = [
 ]
 
 
-def get_crisis_mask(dates, crisis: CrisisEvent) -> list:
-    """Return boolean mask for timestamps falling within a crisis period."""
-    start = datetime.strptime(crisis.start, "%Y-%m-%d")
-    end = datetime.strptime(crisis.end, "%Y-%m-%d")
-    return [(start <= d.replace(tzinfo=None) <= end) if hasattr(d, 'replace') else False for d in dates]
+def get_crisis_by_severity(severity_label: str) -> List[CrisisEvent]:
+    """
+    Filter crises by severity classification.
+
+    Args:
+        severity_label: One of 'mild', 'moderate', 'severe'
+
+    Returns:
+        List of CrisisEvent matching the severity label
+    """
+    return [c for c in CRYPTO_CRISES if c.severity_label == severity_label]
+
+
+def get_crisis_mask(dates, crisis: Optional[CrisisEvent] = None) -> pd.Series:
+    """
+    Return boolean Series for timestamps falling within crisis period(s).
+
+    If crisis is None, returns a mask covering ALL defined crises.
+
+    Args:
+        dates: DatetimeIndex or list of timestamps
+        crisis: Optional single CrisisEvent. If None, uses all crises.
+
+    Returns:
+        pd.Series of bool, True where the timestamp falls in a crisis window
+    """
+    dates_idx = pd.DatetimeIndex(dates)
+    mask = pd.Series(False, index=dates_idx)
+
+    if crisis is not None:
+        crises = [crisis]
+    else:
+        crises = CRYPTO_CRISES
+
+    for c in crises:
+        start = pd.Timestamp(c.start)
+        end = pd.Timestamp(c.end)
+        # Handle timezone-aware indices
+        if dates_idx.tz is not None:
+            start = start.tz_localize(dates_idx.tz)
+            end = end.tz_localize(dates_idx.tz)
+        mask = mask | ((dates_idx >= start) & (dates_idx <= end))
+
+    return mask
 
 
 def get_regime_periods(dates) -> dict:
     """Classify all timestamps into crisis / non-crisis periods."""
-    crisis_mask = [False] * len(dates)
-    for crisis in CRYPTO_CRISES:
-        mask = get_crisis_mask(dates, crisis)
-        for i, m in enumerate(mask):
-            if m:
-                crisis_mask[i] = True
+    mask = get_crisis_mask(dates)
 
     return {
-        "crisis_indices": [i for i, m in enumerate(crisis_mask) if m],
-        "non_crisis_indices": [i for i, m in enumerate(crisis_mask) if not m],
+        "crisis_indices": list(np.where(mask.values)[0]),
+        "non_crisis_indices": list(np.where(~mask.values)[0]),
         "n_crises": len(CRYPTO_CRISES),
-        "crisis_hours": sum(crisis_mask),
+        "crisis_hours": int(mask.sum()),
         "total_hours": len(dates),
-        "crisis_pct": sum(crisis_mask) / len(dates) if dates else 0,
+        "crisis_pct": float(mask.mean()) if len(dates) > 0 else 0,
     }
 
 
@@ -186,7 +250,6 @@ def crisis_stratified_metrics(returns, dates, metric_func) -> dict:
     crisis_rets = returns[periods["crisis_indices"]] if periods["crisis_indices"] else np.array([0])
     non_crisis_rets = returns[periods["non_crisis_indices"]] if periods["non_crisis_indices"] else np.array([0])
 
-    import numpy as np
     return {
         "all": float(metric_func(returns)),
         "crisis": float(metric_func(crisis_rets)) if len(crisis_rets) > 10 else None,
@@ -194,3 +257,20 @@ def crisis_stratified_metrics(returns, dates, metric_func) -> dict:
         "n_crisis_hours": len(periods["crisis_indices"]),
         "n_non_crisis_hours": len(periods["non_crisis_indices"]),
     }
+
+
+def get_crisis_summary() -> pd.DataFrame:
+    """Return a summary DataFrame of all crisis events with severity labels."""
+    rows = []
+    for c in CRYPTO_CRISES:
+        rows.append({
+            "name": c.name,
+            "start": c.start,
+            "end": c.end,
+            "type": c.crisis_type,
+            "severity_score": c.severity,
+            "severity_label": c.severity_label,
+            "btc_drawdown_pct": c.btc_drawdown_pct,
+            "duration_days": c.duration_days,
+        })
+    return pd.DataFrame(rows)

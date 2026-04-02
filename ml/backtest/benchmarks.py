@@ -1,15 +1,18 @@
 """
 Benchmark Portfolio Strategies.
 
-Implements four comparison strategies for evaluating the ensemble:
-  1. Equal Weight (1/N) — monthly rebalance
-  2. BTC Only — 100% buy-and-hold
-  3. 60/40 BTC/USDC — monthly rebalance
-  4. Market-Cap Weighted — monthly rebalance (approximated)
+Implements six comparison strategies for evaluating the ensemble:
+  1. Equal Weight (1/N) -- monthly rebalance
+  2. BTC Only -- 100% buy-and-hold
+  3. 60/40 BTC/USDC -- monthly rebalance
+  4. Market-Cap Weighted -- monthly rebalance (approximated)
+  5. Risk Parity (static) -- equal risk contribution, monthly rebalance
+  6. Minimum Variance -- global minimum variance, monthly rebalance
 """
 import numpy as np
 import pandas as pd
 import logging
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +85,7 @@ class SixtyForty(BenchmarkStrategy):
 class MarketCapWeighted(BenchmarkStrategy):
     """
     Market-cap weighted portfolio, rebalanced monthly.
-    Approximates market cap weights using price × constant supply factors.
+    Approximates market cap weights using price x constant supply factors.
     """
 
     def __init__(self, asset_names: list, rebalance_hours: int = 720):
@@ -112,6 +115,123 @@ class MarketCapWeighted(BenchmarkStrategy):
             w = caps / caps.sum()
             return w
         return current_weights
+
+
+class RiskParityStatic(BenchmarkStrategy):
+    """
+    Equal Risk Contribution (Risk Parity) portfolio, rebalanced monthly.
+
+    Each asset contributes equally to total portfolio risk. Uses a rolling
+    covariance estimate to compute risk contributions and then solves for
+    weights such that w_i * (Sigma w)_i / w^T Sigma w = 1/N for all i.
+
+    This is a static (non-ML) risk parity benchmark -- shows what pure RP
+    does without the ensemble's dynamic regime adjustment.
+    """
+
+    def __init__(self, asset_names: list, rebalance_hours: int = 720,
+                 lookback: int = 720):
+        super().__init__("Risk Parity (Static)", asset_names)
+        self.rebalance_hours = rebalance_hours
+        self.lookback = lookback
+        self._step = 0
+        self._cached_weights: Optional[np.ndarray] = None
+
+    def get_weights(self, t, returns_df, current_weights):
+        self._step += 1
+        if self._step % self.rebalance_hours == 0 or current_weights is None:
+            self._cached_weights = self._compute_rp_weights(t, returns_df)
+            return self._cached_weights
+        return current_weights if current_weights is not None else np.ones(self.n_assets) / self.n_assets
+
+    def _compute_rp_weights(self, t: int, returns_df: pd.DataFrame) -> np.ndarray:
+        """Solve for equal risk contribution weights via iterative bisection."""
+        start = max(0, t - self.lookback)
+        window = returns_df.iloc[start:t + 1]
+
+        if len(window) < 30:
+            return np.ones(self.n_assets) / self.n_assets
+
+        cov = window.cov().values
+        # Regularise: add small ridge to avoid singularity
+        cov += np.eye(self.n_assets) * 1e-8
+
+        # Newton-style iterative risk parity
+        w = np.ones(self.n_assets) / self.n_assets
+        target_rc = 1.0 / self.n_assets
+
+        for _ in range(50):
+            sigma_w = cov @ w
+            port_vol = np.sqrt(w @ sigma_w)
+            if port_vol < 1e-12:
+                break
+            # Marginal risk contribution
+            mrc = sigma_w / port_vol
+            # Risk contribution
+            rc = w * mrc
+            rc_share = rc / rc.sum()
+
+            # Gradient step: adjust weights toward equal RC
+            adjustment = target_rc - rc_share
+            w = w * np.exp(0.5 * adjustment)
+            w = np.maximum(w, 1e-6)
+            w = w / w.sum()
+
+        return w
+
+
+class MinimumVariance(BenchmarkStrategy):
+    """
+    Global Minimum Variance portfolio, rebalanced monthly.
+
+    Minimises portfolio variance: min w^T Sigma w s.t. sum(w)=1, w>=0.
+    Uses analytical solution with long-only constraint via projected gradient.
+    """
+
+    def __init__(self, asset_names: list, rebalance_hours: int = 720,
+                 lookback: int = 720):
+        super().__init__("Minimum Variance", asset_names)
+        self.rebalance_hours = rebalance_hours
+        self.lookback = lookback
+        self._step = 0
+        self._cached_weights: Optional[np.ndarray] = None
+
+    def get_weights(self, t, returns_df, current_weights):
+        self._step += 1
+        if self._step % self.rebalance_hours == 0 or current_weights is None:
+            self._cached_weights = self._compute_minvar_weights(t, returns_df)
+            return self._cached_weights
+        return current_weights if current_weights is not None else np.ones(self.n_assets) / self.n_assets
+
+    def _compute_minvar_weights(self, t: int, returns_df: pd.DataFrame) -> np.ndarray:
+        """Compute global minimum variance weights with long-only constraint."""
+        start = max(0, t - self.lookback)
+        window = returns_df.iloc[start:t + 1]
+
+        if len(window) < 30:
+            return np.ones(self.n_assets) / self.n_assets
+
+        cov = window.cov().values
+        cov += np.eye(self.n_assets) * 1e-8
+
+        # Analytical unconstrained solution: w* = Sigma^{-1} 1 / (1^T Sigma^{-1} 1)
+        try:
+            cov_inv = np.linalg.inv(cov)
+        except np.linalg.LinAlgError:
+            return np.ones(self.n_assets) / self.n_assets
+
+        ones = np.ones(self.n_assets)
+        w = cov_inv @ ones
+        w = w / w.sum()
+
+        # Project to long-only: clip negatives, renormalise
+        w = np.maximum(w, 0.0)
+        total = w.sum()
+        if total < 1e-10:
+            return np.ones(self.n_assets) / self.n_assets
+        w = w / total
+
+        return w
 
 
 def simulate_benchmark(strategy: BenchmarkStrategy, returns_df: pd.DataFrame,
@@ -174,12 +294,14 @@ def simulate_benchmark(strategy: BenchmarkStrategy, returns_df: pd.DataFrame,
 
 def run_all_benchmarks(returns_df: pd.DataFrame, asset_names: list,
                        tc_bps: float = 10) -> dict:
-    """Run all four benchmark strategies and return results."""
+    """Run all six benchmark strategies and return results."""
     benchmarks = {
         "equal_weight": EqualWeight(asset_names),
         "btc_only": BTCOnly(asset_names),
         "sixty_forty": SixtyForty(asset_names),
         "market_cap": MarketCapWeighted(asset_names),
+        "risk_parity_static": RiskParityStatic(asset_names),
+        "min_variance": MinimumVariance(asset_names),
     }
 
     results = {}

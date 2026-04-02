@@ -4,6 +4,34 @@ data:
   end_date: "2025-12-31"
   frequency: "1h"
   source: "binance"
+  retry_attempts: 3
+  fallback_exchanges: ["kraken", "coinbase"]
+  validation:
+    min_coverage_pct: 95
+    max_gap_hours: 24
+
+preprocessing:
+  outlier:
+    method: "winsorize"        # winsorize | mad | zscore
+    winsorize_percentile: [1, 99]
+    sigma_threshold: 5
+  stationarity:
+    test: "adf"
+    significance: 0.05
+  features:
+    volatility_windows: [24, 120, 480]   # 1d, 5d, 20d in hours
+    momentum_windows: [120, 480, 1440]   # 5d, 20d, 60d
+    sharpe_window: 1440                  # 60d
+    correlation_window: 720              # 30d
+    hurst_window: 480                    # 20d
+    parkinson_vol: true
+    garman_klass_vol: true
+    rolling_skew: true
+    rolling_kurtosis: true
+    amihud_illiquidity: true
+  normalization:
+    method: "zscore"           # zscore | rank | none
+    window: 720
 
 garch:
   p: 1
@@ -11,22 +39,54 @@ garch:
   distribution: "studentst"
   rolling_window: 1440
   refit_frequency: 168
+  enable_model_selection: true      # Compare GARCH/EGARCH/GJR-GARCH per asset via BIC
+  enable_diagnostics: true          # Ljung-Box, ARCH-LM, Jarque-Bera on residuals
+  enable_dcc_midas: false           # DCC-MIDAS long-run correlation (requires macro data)
+  enable_bootstrap: false           # Bootstrap CIs (slow: ~200 resamples)
+  bootstrap_n_samples: 200
 
 hmm:
   n_states: 3
   covariance_type: "full"
   n_iter: 200
   features: ["log_returns_mean_24h", "realised_vol_120h", "volume_ratio_480h"]
+  enable_state_selection: true      # Compare 2-5 states via BIC + CV log-likelihood
+  state_range: [2, 3, 4, 5]
+  n_init: 10                        # Random restarts to avoid local optima
+  cv_folds: 5                       # Time-series CV folds for state selection
+  transition_spike_threshold: 0.3   # Alert when P(switch) exceeds this
 
 rl:
   algorithm: "SAC"
-  state_dim: 38
+  state_dim: 48                     # Updated: was 38, added BTC corr + transition prob + kelly
   action_dim: 8
   training:
     total_timesteps: 500000
     learning_rate: 0.0003
     batch_size: 256
     n_seeds: 5
+    top_k_ensemble: 3               # Ensemble of top-K seeds for robust predictions
+    early_stopping_patience: 50000  # Stop if validation Sharpe plateaus
+    eval_freq: 10000                # Evaluate every N training steps
+    enable_curriculum: true         # Phase 1: simple reward, Phase 2: full reward
+    enable_lr_schedule: true        # Cosine annealing learning rate
+    enable_obs_normalization: true  # RunningMeanStd observation normalization
+  reward:
+    sharpe_coeff: 1.0
+    cvar_penalty: 2.0
+    drawdown_penalty: 3.0
+    drawdown_threshold: 0.10
+    turnover_penalty: 0.5
+    risk_parity_penalty: 1.0        # Penalise unequal risk contributions
+    concentration_penalty: 0.5      # Penalise HHI above threshold
+    hhi_threshold: 0.25             # Max acceptable Herfindahl-Hirschman Index
+    reward_clip: 5.0                # Clip rewards for training stability
+  market_impact:
+    coefficient: 0.1                # Square-root impact model coefficient
+    exponent: 0.5                   # Square-root model exponent
+    slippage_vol_mult: 0.05         # Slippage = mult * weight * vol * |delta_w|
+  episode_length: 0                 # 0 = use all data, >0 = fixed episode length
+  btc_corr_lookback: 168            # 7 days in hours for BTC correlation
 
 ensemble:
   method: "inverse_variance"
