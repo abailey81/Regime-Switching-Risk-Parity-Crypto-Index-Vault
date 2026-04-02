@@ -558,8 +558,19 @@ class UniverseScreener:
                     if _cls is None:
                         continue
                 pool_list = []
+                # Build authenticated config matching Stage 1's _make_exchange()
+                _auth_opts = {"enableRateLimit": True}
+                _prefix = _ename.upper().replace("BINANCEUS", "BINANCE")
+                if hasattr(self, '_connected_exchanges') and _ename in self._connected_exchanges:
+                    _src = self._connected_exchanges[_ename]
+                    if hasattr(_src, 'apiKey') and _src.apiKey:
+                        _auth_opts["apiKey"] = _src.apiKey
+                    if hasattr(_src, 'secret') and _src.secret:
+                        _auth_opts["secret"] = _src.secret
+                    if hasattr(_src, 'password') and _src.password:
+                        _auth_opts["password"] = _src.password
                 for _ in range(max(4, _n_workers // len(_exchange_order))):
-                    pool_list.append(_cls({"enableRateLimit": True}))
+                    pool_list.append(_cls(_auth_opts))
                 _exchange_pools[_ename] = pool_list
                 _safe_log(f"  {_ename}: {len(pool_list)} instances ready")
             except Exception as _e:
@@ -593,46 +604,59 @@ class UniverseScreener:
                 current = last_ts + 1
             return all_candles
 
-        # Concurrent fetching with multi-exchange fallback
-        def _fetch_single(sym: str) -> Tuple[str, Optional[pd.DataFrame]]:
-            """Fetch OHLCV trying each exchange until one succeeds."""
-            for exch_name in _exchange_order:
-                ex = _get_exchange(exch_name)
-                if ex is None:
-                    continue
+        # ── Advanced Parallel Cascade: race ALL exchanges simultaneously per asset ──
+        #
+        # For each asset, we fire requests to ALL exchanges at once. The first
+        # exchange to return valid data wins — all others are cancelled. This is
+        # dramatically faster than sequential fallback because we don't wait for
+        # slow/failed exchanges before trying the next one.
+
+        def _try_exchange_for_symbol(exch_name: str, sym: str) -> Optional[pd.DataFrame]:
+            """Attempt to fetch OHLCV for sym from a single exchange. Returns df or None."""
+            ex = _get_exchange(exch_name)
+            if ex is None:
+                return None
+            for quote in ["USDT", "USD"]:
+                pair = f"{sym}/{quote}"
                 try:
-                    # Try USDT pair first, then USD
-                    for quote in ["USDT", "USD"]:
-                        pair = f"{sym}/{quote}"
-                        try:
-                            all_candles = _fetch_ohlcv_from(ex, pair, since_ts)
-                            if all_candles:
-                                break
-                        except Exception:
-                            continue
-                    else:
-                        continue
-
-                    if not all_candles:
-                        continue
-
-                    df = pd.DataFrame(
-                        all_candles,
-                        columns=["timestamp", "open", "high", "low", "close", "volume"],
-                    )
-                    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-                    df = df.set_index("timestamp").sort_index()
-                    df = df[~df.index.duplicated(keep="first")]
-                    df["volume_usd"] = df["close"] * df["volume"]
-
-                    # Cache individually
-                    cache_file = ohlcv_cache_dir / f"{sym}_daily.parquet"
-                    df.to_parquet(cache_file)
-
-                    return sym, df
-
+                    candles = _fetch_ohlcv_from(ex, pair, since_ts)
+                    if candles and len(candles) >= 30:  # at least 30 daily candles
+                        df = pd.DataFrame(
+                            candles,
+                            columns=["timestamp", "open", "high", "low", "close", "volume"],
+                        )
+                        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+                        df = df.set_index("timestamp").sort_index()
+                        df = df[~df.index.duplicated(keep="first")]
+                        df["volume_usd"] = df["close"] * df["volume"]
+                        return df
                 except Exception:
                     continue
+            return None
+
+        def _fetch_single(sym: str) -> Tuple[str, Optional[pd.DataFrame]]:
+            """
+            Race ALL exchanges in parallel for a single asset.
+            First valid result wins; remaining futures are cancelled.
+            """
+            from concurrent.futures import ThreadPoolExecutor as _InnerPool, as_completed as _ac
+
+            with _InnerPool(max_workers=len(_exchange_order)) as race_pool:
+                race_futures = {
+                    race_pool.submit(_try_exchange_for_symbol, ename, sym): ename
+                    for ename in _exchange_order
+                }
+                for fut in _ac(race_futures):
+                    result = fut.result()
+                    if result is not None and len(result) >= 30:
+                        # Cancel remaining futures
+                        for other_fut in race_futures:
+                            if other_fut != fut and not other_fut.done():
+                                other_fut.cancel()
+                        # Cache and return winner
+                        cache_file = ohlcv_cache_dir / f"{sym}_daily.parquet"
+                        result.to_parquet(cache_file)
+                        return sym, result
 
             return sym, None
 
