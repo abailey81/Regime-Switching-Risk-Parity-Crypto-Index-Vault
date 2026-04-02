@@ -650,11 +650,17 @@ class UniverseScreener:
         df = df.sort_values("volume_24h_usd", ascending=False)
         df = df.drop_duplicates(subset="symbol", keep="first")
 
+        # Remove assets with zero/negligible volume (they won't have OHLCV data)
+        min_vol = 10_000  # $10K daily volume minimum to even attempt fetching
+        before_vol_filter = len(df)
+        df = df[df["volume_24h_usd"] > min_vol]
+        _safe_log(f"Stage 1: Volume filter (>${min_vol:,.0f}): {before_vol_filter} → {len(df)} assets")
+
         # Sort by volume, take top N
         df = df.sort_values("volume_24h_usd", ascending=False).head(top_n)
         df = df.reset_index(drop=True)
 
-        _safe_log(f"Stage 1: {len(df)} unique assets after dedup (from {len(_all_records)} raw pairs)")
+        _safe_log(f"Stage 1: Final universe: {len(df)} assets (from {len(_all_records)} raw pairs)")
 
         self.universe_df = df
 
