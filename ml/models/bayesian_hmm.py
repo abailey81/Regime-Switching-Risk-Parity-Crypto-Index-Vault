@@ -16,6 +16,9 @@ Enhancements:
   - predict_regime_change_probability() method
 """
 import logging
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -30,6 +33,8 @@ except ImportError:
         return iterable if iterable is not None else range(0)
 
 logger = logging.getLogger(__name__)
+
+_MAX_WORKERS = min(8, os.cpu_count() or 4)
 
 
 class BayesianRegimeHMM:
@@ -138,42 +143,48 @@ class BayesianRegimeHMM:
         Returns:
             Optimal number of states
         """
-        logger.info("  State selection: comparing models...")
+        logger.info("  State selection: comparing models (parallel)...")
 
         n_obs = X_scaled.shape[0]
         results = {}
 
-        state_bar = tqdm(self.state_range, desc="State selection", unit="n_states", leave=True)
-        for n_s in state_bar:
-            state_bar.set_postfix(n_states=n_s)
+        def _evaluate_n_states(n_s):
+            """Evaluate a single state count. Thread-safe."""
             try:
-                # Fit with multiple restarts
                 model, best_ll = self._fit_with_restarts(X_scaled, n_s)
-
-                # BIC = -2*LL + k*ln(n) where k = free parameters
                 n_features = X_scaled.shape[1]
                 k = self._count_hmm_params(n_s, n_features)
                 bic = -2 * best_ll + k * np.log(n_obs)
-
-                # Cross-validated log-likelihood
                 cv_ll = self._cross_validate_hmm(X_scaled, n_s)
-
-                results[n_s] = {
+                return n_s, {
                     "bic": float(bic),
                     "log_likelihood": float(best_ll),
                     "cv_log_likelihood": float(cv_ll),
                     "n_params": k,
                 }
-
-                state_bar.set_postfix(n_states=n_s, BIC=f"{bic:.1f}")
-                logger.info(
-                    f"    n_states={n_s}: BIC={bic:.1f}, LL={best_ll:.1f}, CV_LL={cv_ll:.1f}"
-                )
             except Exception as e:
                 logger.warning(f"    n_states={n_s}: FAILED ({e})")
-                results[n_s] = {"bic": np.inf, "log_likelihood": -np.inf,
-                                "cv_log_likelihood": -np.inf, "n_params": 0}
+                return n_s, {"bic": np.inf, "log_likelihood": -np.inf,
+                             "cv_log_likelihood": -np.inf, "n_params": 0}
 
+        state_bar = tqdm(total=len(self.state_range), desc="State selection",
+                         unit="n_states", leave=True)
+
+        with ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, len(self.state_range))) as pool:
+            futures = {pool.submit(_evaluate_n_states, n_s): n_s for n_s in self.state_range}
+            for future in as_completed(futures):
+                n_s, result = future.result()
+                results[n_s] = result
+                state_bar.update(1)
+                if np.isfinite(result["bic"]):
+                    state_bar.set_postfix(n_states=n_s, BIC=f"{result['bic']:.1f}")
+                    logger.info(
+                        f"    n_states={n_s}: BIC={result['bic']:.1f}, "
+                        f"LL={result['log_likelihood']:.1f}, "
+                        f"CV_LL={result['cv_log_likelihood']:.1f}"
+                    )
+
+        state_bar.close()
         self.state_selection_results = results
 
         # Select by lowest BIC (primary), break ties with CV log-likelihood
@@ -239,36 +250,34 @@ class BayesianRegimeHMM:
         if fold_size < 50:
             return -np.inf
 
-        cv_scores = []
-        cv_bar = tqdm(range(1, self.cv_folds + 1),
-                       desc=f"CV folds | {n_states} states",
-                       unit="fold", leave=False)
-        for fold in cv_bar:
-            cv_bar.set_postfix(fold=f"{fold}/{self.cv_folds}")
+        def _evaluate_fold(fold):
+            """Evaluate a single CV fold. Thread-safe."""
             train_end = fold_size * (fold + 1)
             test_start = train_end
             test_end = min(test_start + fold_size, n_obs)
-
             if test_end <= test_start:
-                continue
-
+                return None
             X_train = X_scaled[:train_end]
             X_test = X_scaled[test_start:test_end]
-
             try:
                 model = hmm.GaussianHMM(
                     n_components=n_states,
                     covariance_type=self.covariance_type,
                     n_iter=self.n_iter,
-                    random_state=self.random_state,
+                    random_state=self.random_state + fold,
                 )
                 model.fit(X_train)
-                score = model.score(X_test)
-                cv_scores.append(score)
-                cv_bar.set_postfix(fold=f"{fold}/{self.cv_folds}",
-                                    mean_LL=f"{np.mean(cv_scores):.1f}")
+                return model.score(X_test)
             except Exception:
-                continue
+                return None
+
+        cv_scores = []
+        with ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, self.cv_folds)) as pool:
+            futures = [pool.submit(_evaluate_fold, fold) for fold in range(1, self.cv_folds + 1)]
+            for future in as_completed(futures):
+                score = future.result()
+                if score is not None:
+                    cv_scores.append(score)
 
         return float(np.mean(cv_scores)) if cv_scores else -np.inf
 
@@ -292,10 +301,8 @@ class BayesianRegimeHMM:
         convergence_scores = []
         n_converged_count = 0
 
-        restart_bar = tqdm(range(self.n_init),
-                           desc=f"Random restarts | {n_states} states",
-                           unit="restart", leave=False)
-        for i in restart_bar:
+        def _single_restart(i):
+            """Fit a single HMM restart. Thread-safe."""
             try:
                 model = hmm.GaussianHMM(
                     n_components=n_states,
@@ -314,18 +321,29 @@ class BayesianRegimeHMM:
 
                 model.fit(X_scaled)
                 ll = model.score(X_scaled)
-                convergence_scores.append(ll)
-                n_converged_count += 1
-
-                if ll > best_ll:
-                    best_ll = ll
-                    best_model = model
+                return i, model, ll
             except Exception:
-                convergence_scores.append(-np.inf)
-                continue
-            restart_bar.set_postfix(converged=f"{n_converged_count}/{i + 1}",
-                                    best_LL=f"{best_ll:.1f}")
+                return i, None, -np.inf
 
+        restart_bar = tqdm(total=self.n_init,
+                           desc=f"Random restarts | {n_states} states",
+                           unit="restart", leave=False)
+
+        with ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, self.n_init)) as pool:
+            futures = {pool.submit(_single_restart, i): i for i in range(self.n_init)}
+            for future in as_completed(futures):
+                i, model, ll = future.result()
+                convergence_scores.append(ll)
+                if np.isfinite(ll):
+                    n_converged_count += 1
+                    if ll > best_ll:
+                        best_ll = ll
+                        best_model = model
+                restart_bar.update(1)
+                restart_bar.set_postfix(converged=f"{n_converged_count}/{len(convergence_scores)}",
+                                        best_LL=f"{best_ll:.1f}")
+
+        restart_bar.close()
         self.convergence_history = convergence_scores
 
         if best_model is None:

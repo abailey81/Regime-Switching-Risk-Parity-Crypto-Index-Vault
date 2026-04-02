@@ -18,6 +18,9 @@ Enhancements:
   - Bootstrap confidence intervals and uncertainty decomposition
 """
 import logging
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -33,6 +36,8 @@ except ImportError:
         return iterable if iterable is not None else range(0)
 
 logger = logging.getLogger(__name__)
+
+_MAX_WORKERS = min(8, os.cpu_count() or 4)
 
 
 class StudentTGarchDCC:
@@ -92,45 +97,57 @@ class StudentTGarchDCC:
 
         logger.info(f"Fitting Student-t GARCH({self.p},{self.q}) for {n_assets} assets...")
 
-        # ── Step 1: Fit univariate GARCH for each asset ──
+        # ── Step 1: Fit univariate GARCH for each asset (parallel) ──
         conditional_vols = pd.DataFrame(index=returns_df.index, columns=assets, dtype=float)
         std_resids = pd.DataFrame(index=returns_df.index, columns=assets, dtype=float)
 
-        asset_bar = tqdm(assets, desc="Fitting GARCH", unit="asset", leave=True)
-        for col in asset_bar:
-            asset_bar.set_postfix(asset=col)
-            series = returns_df[col].dropna() * 100  # Scale to percentage for numerical stability
+        asset_bar = tqdm(total=n_assets, desc="Fitting GARCH", unit="asset", leave=True)
+        results_lock = threading.Lock()
 
+        def _fit_asset(col):
+            """Fit GARCH for a single asset. Thread-safe (arch releases GIL)."""
+            series = returns_df[col].dropna() * 100
             if self.enable_model_selection:
                 result, vol_type = self._select_best_model(series, col)
             else:
                 result, vol_type = self._fit_single_garch(series, col, "GARCH")
+            return col, series, result, vol_type
 
-            if result is not None:
-                self.garch_results[col] = result
-                self.selected_vol_type[col] = vol_type
+        with ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, n_assets)) as pool:
+            futures = {pool.submit(_fit_asset, col): col for col in assets}
+            for future in as_completed(futures):
+                col, series, result, vol_type = future.result()
 
-                # Extract conditional volatility and standardised residuals
-                conditional_vols[col] = result.conditional_volatility / 100  # Back to decimal
-                std_resids[col] = result.std_resid
+                if result is not None:
+                    with results_lock:
+                        self.garch_results[col] = result
+                        self.selected_vol_type[col] = vol_type
+                        conditional_vols[col] = result.conditional_volatility / 100
+                        std_resids[col] = result.std_resid
 
-                nu = result.params.get("nu", 30)
-                logger.info(
-                    f"  {col}: model={vol_type}, "
-                    f"alpha={result.params.get('alpha[1]', result.params.get('alpha[1]', 0)):.4f}, "
-                    f"beta={result.params.get('beta[1]', 0):.4f}, "
-                    f"nu={nu:.1f}"
-                )
+                    nu = result.params.get("nu", 30)
+                    logger.info(
+                        f"  {col}: model={vol_type}, "
+                        f"alpha={result.params.get('alpha[1]', result.params.get('alpha[1]', 0)):.4f}, "
+                        f"beta={result.params.get('beta[1]', 0):.4f}, "
+                        f"nu={nu:.1f}"
+                    )
 
-                # Run diagnostics on residuals
-                if self.enable_diagnostics:
-                    self._run_diagnostics(result, col)
-            else:
-                logger.warning(f"  {col}: All GARCH fits failed, using EWMA fallback")
-                ewma_vol = series.ewm(span=60).std() / 100
-                conditional_vols[col] = ewma_vol
-                std_resids[col] = (series / 100) / ewma_vol
-                self.selected_vol_type[col] = "EWMA"
+                    # Run diagnostics on residuals (parallel per asset below)
+                    if self.enable_diagnostics:
+                        self._run_diagnostics_parallel(result, col)
+                else:
+                    logger.warning(f"  {col}: All GARCH fits failed, using EWMA fallback")
+                    ewma_vol = series.ewm(span=60).std() / 100
+                    with results_lock:
+                        conditional_vols[col] = ewma_vol
+                        std_resids[col] = (series / 100) / ewma_vol
+                        self.selected_vol_type[col] = "EWMA"
+
+                asset_bar.update(1)
+                asset_bar.set_postfix(asset=col)
+
+        asset_bar.close()
 
         self.conditional_vols = conditional_vols.dropna()
         self.std_residuals = std_resids.loc[self.conditional_vols.index].dropna()
@@ -169,14 +186,21 @@ class StudentTGarchDCC:
         bic_scores: Dict[str, float] = {}
         results: Dict[str, object] = {}
 
-        model_bar = tqdm(candidates.items(), desc=f"Model selection | {asset}",
-                         unit="model", leave=False, total=len(candidates))
-        for name, kwargs in model_bar:
-            model_bar.set_postfix(model=name)
+        # Fit all 3 model types in parallel (each is independent)
+        def _fit_candidate(name, kwargs):
             result, _ = self._fit_single_garch(series, asset, name, **kwargs)
-            if result is not None:
-                bic_scores[name] = result.bic
-                results[name] = result
+            return name, result
+
+        with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
+            futures = {
+                pool.submit(_fit_candidate, name, kwargs): name
+                for name, kwargs in candidates.items()
+            }
+            for future in as_completed(futures):
+                name, result = future.result()
+                if result is not None:
+                    bic_scores[name] = result.bic
+                    results[name] = result
 
         if not bic_scores:
             return None, "NONE"
@@ -236,11 +260,11 @@ class StudentTGarchDCC:
     # ─────────────────────────────────────────────────
     #  DIAGNOSTIC TESTS
     # ─────────────────────────────────────────────────
-    def _run_diagnostics(self, result: object, asset: str) -> Dict[str, dict]:
+    def _run_diagnostics_parallel(self, result: object, asset: str) -> Dict[str, dict]:
         """
-        Run diagnostic tests on standardised residuals after fitting.
+        Run diagnostic tests on standardised residuals in parallel.
 
-        Tests:
+        Tests (all 3 run concurrently):
             1. Ljung-Box: No remaining autocorrelation in residuals
             2. ARCH-LM: No remaining ARCH effects (heteroskedasticity)
             3. Jarque-Bera: Normality / fat tails check
@@ -255,63 +279,70 @@ class StudentTGarchDCC:
         std_resid = result.std_resid.dropna().values
         diag = {}
 
-        # 1. Ljung-Box test on standardised residuals (lag 10)
-        try:
-            from scipy.stats import chi2
-            n = len(std_resid)
-            max_lag = min(10, n // 5)
-            acf_vals = self._compute_acf(std_resid, max_lag)
-            lb_stat = n * (n + 2) * np.sum(acf_vals ** 2 / np.arange(n - 1, n - max_lag - 1, -1))
-            lb_pvalue = 1 - chi2.cdf(lb_stat, df=max_lag)
-            lb_pass = lb_pvalue > 0.05
-            diag["ljung_box"] = {
-                "statistic": float(lb_stat),
-                "p_value": float(lb_pvalue),
-                "lags": max_lag,
-                "pass": lb_pass,
-            }
-        except Exception as e:
-            diag["ljung_box"] = {"error": str(e), "pass": None}
+        def _ljung_box():
+            try:
+                from scipy.stats import chi2
+                n = len(std_resid)
+                max_lag = min(10, n // 5)
+                acf_vals = self._compute_acf(std_resid, max_lag)
+                lb_stat = n * (n + 2) * np.sum(acf_vals ** 2 / np.arange(n - 1, n - max_lag - 1, -1))
+                lb_pvalue = 1 - chi2.cdf(lb_stat, df=max_lag)
+                lb_pass = lb_pvalue > 0.05
+                return "ljung_box", {
+                    "statistic": float(lb_stat),
+                    "p_value": float(lb_pvalue),
+                    "lags": max_lag,
+                    "pass": lb_pass,
+                }
+            except Exception as e:
+                return "ljung_box", {"error": str(e), "pass": None}
 
-        # 2. ARCH-LM test on residuals (check no remaining heteroskedasticity)
-        try:
-            resid_sq = std_resid ** 2
-            n = len(resid_sq)
-            lm_lags = min(5, n // 5)
-            # Regress squared residuals on their lags
-            Y = resid_sq[lm_lags:]
-            X = np.column_stack([resid_sq[lm_lags - i - 1: n - i - 1] for i in range(lm_lags)])
-            X = np.column_stack([np.ones(len(Y)), X])
-            beta = np.linalg.lstsq(X, Y, rcond=None)[0]
-            Y_hat = X @ beta
-            ss_res = np.sum((Y - Y_hat) ** 2)
-            ss_tot = np.sum((Y - Y.mean()) ** 2)
-            r_squared = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
-            lm_stat = n * r_squared
-            lm_pvalue = 1 - chi2.cdf(lm_stat, df=lm_lags)
-            lm_pass = lm_pvalue > 0.05
-            diag["arch_lm"] = {
-                "statistic": float(lm_stat),
-                "p_value": float(lm_pvalue),
-                "lags": lm_lags,
-                "pass": lm_pass,
-            }
-        except Exception as e:
-            diag["arch_lm"] = {"error": str(e), "pass": None}
+        def _arch_lm():
+            try:
+                from scipy.stats import chi2
+                resid_sq = std_resid ** 2
+                n = len(resid_sq)
+                lm_lags = min(5, n // 5)
+                Y = resid_sq[lm_lags:]
+                X = np.column_stack([resid_sq[lm_lags - i - 1: n - i - 1] for i in range(lm_lags)])
+                X = np.column_stack([np.ones(len(Y)), X])
+                beta = np.linalg.lstsq(X, Y, rcond=None)[0]
+                Y_hat = X @ beta
+                ss_res = np.sum((Y - Y_hat) ** 2)
+                ss_tot = np.sum((Y - Y.mean()) ** 2)
+                r_squared = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+                lm_stat = n * r_squared
+                lm_pvalue = 1 - chi2.cdf(lm_stat, df=lm_lags)
+                lm_pass = lm_pvalue > 0.05
+                return "arch_lm", {
+                    "statistic": float(lm_stat),
+                    "p_value": float(lm_pvalue),
+                    "lags": lm_lags,
+                    "pass": lm_pass,
+                }
+            except Exception as e:
+                return "arch_lm", {"error": str(e), "pass": None}
 
-        # 3. Jarque-Bera test on standardised residuals
-        try:
-            jb_stat, jb_pvalue = sp_stats.jarque_bera(std_resid)
-            jb_pass = jb_pvalue > 0.05  # Will often fail for crypto (fat tails expected)
-            diag["jarque_bera"] = {
-                "statistic": float(jb_stat),
-                "p_value": float(jb_pvalue),
-                "skewness": float(sp_stats.skew(std_resid)),
-                "kurtosis": float(sp_stats.kurtosis(std_resid)),
-                "pass": jb_pass,
-            }
-        except Exception as e:
-            diag["jarque_bera"] = {"error": str(e), "pass": None}
+        def _jarque_bera():
+            try:
+                jb_stat, jb_pvalue = sp_stats.jarque_bera(std_resid)
+                jb_pass = jb_pvalue > 0.05
+                return "jarque_bera", {
+                    "statistic": float(jb_stat),
+                    "p_value": float(jb_pvalue),
+                    "skewness": float(sp_stats.skew(std_resid)),
+                    "kurtosis": float(sp_stats.kurtosis(std_resid)),
+                    "pass": jb_pass,
+                }
+            except Exception as e:
+                return "jarque_bera", {"error": str(e), "pass": None}
+
+        # Run all 3 tests in parallel
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [pool.submit(fn) for fn in [_ljung_box, _arch_lm, _jarque_bera]]
+            for future in as_completed(futures):
+                test_name, test_result = future.result()
+                diag[test_name] = test_result
 
         self.diagnostic_results[asset] = diag
 
@@ -329,6 +360,10 @@ class StudentTGarchDCC:
         logger.info("\n".join(log_lines))
 
         return diag
+
+    def _run_diagnostics(self, result: object, asset: str) -> Dict[str, dict]:
+        """Legacy sequential diagnostics — delegates to parallel version."""
+        return self._run_diagnostics_parallel(result, asset)
 
     @staticmethod
     def _compute_acf(x: np.ndarray, max_lag: int) -> np.ndarray:
@@ -624,10 +659,11 @@ class StudentTGarchDCC:
     # ─────────────────────────────────────────────────
     def _bootstrap_parameters(self, returns_df: pd.DataFrame) -> None:
         """
-        Bootstrap confidence intervals on GARCH parameters.
+        Bootstrap confidence intervals on GARCH parameters (parallel).
 
         Uses block bootstrap (preserving temporal structure) to estimate
         parameter uncertainty and propagate to covariance forecast.
+        Each bootstrap sample is independent -- perfect for parallelism.
 
         Args:
             returns_df: Original return series
@@ -642,12 +678,11 @@ class StudentTGarchDCC:
         param_samples: Dict[str, List[np.ndarray]] = {col: [] for col in returns_df.columns}
         cov_forecasts: List[np.ndarray] = []
 
-        n_valid = 0
-        boot_bar = tqdm(range(n_samples), desc="Bootstrap", unit="sample", leave=True)
-        for b in boot_bar:
-            # Block bootstrap index
-            n_blocks = n_obs // block_size + 1
-            starts = np.random.randint(0, n_obs - block_size, size=n_blocks)
+        def _run_single_bootstrap(b):
+            """Run a single bootstrap resample. Thread-safe."""
+            rng = np.random.RandomState(b + 1000)
+            n_blocks_needed = n_obs // block_size + 1
+            starts = rng.randint(0, n_obs - block_size, size=n_blocks_needed)
             indices = np.concatenate([np.arange(s, s + block_size) for s in starts])[:n_obs]
             boot_df = returns_df.iloc[indices].reset_index(drop=True)
 
@@ -659,15 +694,31 @@ class StudentTGarchDCC:
                 )
                 boot_model.fit(boot_df)
 
+                boot_params = {}
                 for col in returns_df.columns:
                     if col in boot_model.garch_results:
-                        param_samples[col].append(boot_model.garch_results[col].params.values)
+                        boot_params[col] = boot_model.garch_results[col].params.values
 
-                cov_forecasts.append(boot_model.forecast_covariance())
-                n_valid += 1
+                return boot_params, boot_model.forecast_covariance()
             except Exception:
-                continue  # Skip failed bootstrap samples
-            boot_bar.set_postfix(valid=n_valid, failed=b + 1 - n_valid)
+                return None, None
+
+        n_valid = 0
+        boot_bar = tqdm(total=n_samples, desc="Bootstrap", unit="sample", leave=True)
+
+        with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+            futures = {pool.submit(_run_single_bootstrap, b): b for b in range(n_samples)}
+            for future in as_completed(futures):
+                boot_params, boot_cov = future.result()
+                if boot_params is not None:
+                    for col, params in boot_params.items():
+                        param_samples[col].append(params)
+                    cov_forecasts.append(boot_cov)
+                    n_valid += 1
+                boot_bar.update(1)
+                boot_bar.set_postfix(valid=n_valid)
+
+        boot_bar.close()
 
         # Compute confidence intervals
         for col, samples in param_samples.items():

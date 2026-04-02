@@ -9,10 +9,14 @@ Implements six comparison strategies for evaluating the ensemble:
   5. Risk Parity (static) -- equal risk contribution, monthly rebalance
   6. Minimum Variance -- global minimum variance, monthly rebalance
 """
+import os
 import numpy as np
 import pandas as pd
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
+
+_MAX_WORKERS = min(8, os.cpu_count() or 4)
 
 try:
     from tqdm import tqdm
@@ -317,7 +321,7 @@ def simulate_benchmark(strategy: BenchmarkStrategy, returns_df: pd.DataFrame,
 
 def run_all_benchmarks(returns_df: pd.DataFrame, asset_names: list,
                        tc_bps: float = 10) -> dict:
-    """Run all six benchmark strategies and return results."""
+    """Run all six benchmark strategies in parallel and return results."""
     benchmarks = {
         "equal_weight": EqualWeight(asset_names),
         "btc_only": BTCOnly(asset_names),
@@ -327,11 +331,23 @@ def run_all_benchmarks(returns_df: pd.DataFrame, asset_names: list,
         "min_variance": MinimumVariance(asset_names),
     }
 
-    results = {}
-    bench_bar = tqdm(benchmarks.items(), desc="Benchmarks", unit="strategy", leave=True)
-    for key, strategy in bench_bar:
-        bench_bar.set_postfix(strategy=strategy.name[:25])
+    def _run_single(key: str, strategy: BenchmarkStrategy) -> tuple:
         logger.info(f"  Simulating {strategy.name}...")
-        results[key] = simulate_benchmark(strategy, returns_df, tc_bps)
+        return key, simulate_benchmark(strategy, returns_df, tc_bps)
 
+    results = {}
+    bench_bar = tqdm(total=len(benchmarks), desc="Benchmarks", unit="strategy", leave=True)
+
+    with ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, len(benchmarks))) as pool:
+        futures = {
+            pool.submit(_run_single, key, strategy): key
+            for key, strategy in benchmarks.items()
+        }
+        for future in as_completed(futures):
+            key, result = future.result()
+            results[key] = result
+            bench_bar.update(1)
+            bench_bar.set_postfix(strategy=result["name"][:25])
+
+    bench_bar.close()
     return results

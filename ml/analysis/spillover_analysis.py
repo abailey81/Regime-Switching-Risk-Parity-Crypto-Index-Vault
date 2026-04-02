@@ -22,12 +22,16 @@ References:
 Adapted from: Crypto-Statistical-Arbitrage concepts (crisis_analyzer.py).
 """
 import logging
+import os
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from scipy import linalg
+
+_MAX_WORKERS = min(8, os.cpu_count() or 4)
 
 try:
     from tqdm import tqdm
@@ -257,33 +261,48 @@ class SpilloverAnalyzer:
             )
             return pd.Series(dtype=float, name="rolling_spillover")
 
-        indices = []
-        values = []
-
         # Step through with stride = window // 10 for efficiency
         stride = max(1, win // 10)
-        n_windows = len(range(win, T, stride))
+        window_ends = list(range(win, T, stride))
+        n_windows = len(window_ends)
 
-        roll_bar = tqdm(range(win, T, stride), desc="Rolling Spillover", unit="window",
-                        total=n_windows, leave=False)
-        for end in roll_bar:
+        var_lags = self._var_lags
+        forecast_horizon = self._forecast_horizon
+
+        def _compute_window(end: int) -> Tuple[int, float]:
+            """Compute spillover index for a single window position."""
             start = end - win
             sub = returns.iloc[start:end]
             try:
                 analyzer = SpilloverAnalyzer(config={
-                    "spillover_var_lags": self._var_lags,
-                    "spillover_forecast_horizon": self._forecast_horizon,
+                    "spillover_var_lags": var_lags,
+                    "spillover_forecast_horizon": forecast_horizon,
                 })
-                analyzer.fit(sub, self._var_lags, self._forecast_horizon)
+                analyzer.fit(sub, var_lags, forecast_horizon)
                 tsi = analyzer.total_spillover_index()
             except Exception as e:
                 logger.debug("Rolling spillover at %d failed: %s", end, e)
                 tsi = np.nan
+            return end, tsi
 
-            indices.append(returns.index[end - 1])
-            values.append(tsi)
-            if not np.isnan(tsi):
-                roll_bar.set_postfix(SI=f"{tsi:.1f}%")
+        # Run all window computations in parallel
+        results_map: Dict[int, float] = {}
+        roll_bar = tqdm(total=n_windows, desc="Rolling Spillover", unit="window", leave=False)
+
+        with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+            futures = {pool.submit(_compute_window, end): end for end in window_ends}
+            for future in as_completed(futures):
+                end, tsi = future.result()
+                results_map[end] = tsi
+                roll_bar.update(1)
+                if not np.isnan(tsi):
+                    roll_bar.set_postfix(SI=f"{tsi:.1f}%")
+
+        roll_bar.close()
+
+        # Reconstruct in original order
+        indices = [returns.index[end - 1] for end in window_ends]
+        values = [results_map[end] for end in window_ends]
 
         result = pd.Series(values, index=indices, name="rolling_spillover")
 
@@ -323,8 +342,12 @@ class SpilloverAnalyzer:
         results: Dict[str, Dict] = {}
 
         crisis_mask = np.zeros(len(returns), dtype=bool)
+        var_lags = self._var_lags
+        forecast_horizon = self._forecast_horizon
 
-        for event in tqdm(crisis_events, desc="Crisis spillover", unit="event", leave=False):
+        # Pre-compute masks and collect events eligible for parallel analysis
+        event_slices: Dict[str, pd.DataFrame] = {}
+        for event in crisis_events:
             name = event.get("name", "unnamed")
             start = pd.to_datetime(event.get("start"))
             end = pd.to_datetime(event.get("end"))
@@ -333,7 +356,7 @@ class SpilloverAnalyzer:
             crisis_mask |= mask.values
             n_obs = int(mask.sum())
 
-            if n_obs < self._var_lags + self._forecast_horizon + 20:
+            if n_obs < var_lags + forecast_horizon + 20:
                 logger.warning(
                     "Crisis '%s': only %d observations — insufficient for VAR",
                     name, n_obs,
@@ -343,43 +366,47 @@ class SpilloverAnalyzer:
                     "n_obs": n_obs,
                     "directional_spillovers": None,
                 }
-                continue
+            else:
+                event_slices[name] = returns.loc[mask]
 
+        # Add non-crisis slice
+        non_crisis = returns.iloc[~crisis_mask]
+        if len(non_crisis) > var_lags + forecast_horizon + 50:
+            event_slices["non_crisis"] = non_crisis
+
+        def _analyze_event(name: str, sub: pd.DataFrame) -> Tuple[str, Dict]:
+            """Fit VAR + GFEVD for a single event period."""
             try:
-                sub = returns.loc[mask]
                 analyzer = SpilloverAnalyzer()
-                analyzer.fit(sub, self._var_lags, self._forecast_horizon)
-                results[name] = {
+                analyzer.fit(sub, var_lags, forecast_horizon)
+                return name, {
                     "total_spillover": analyzer.total_spillover_index(),
-                    "n_obs": n_obs,
+                    "n_obs": len(sub),
                     "directional_spillovers": analyzer.directional_spillovers(),
                 }
             except Exception as e:
                 logger.error("Crisis '%s' spillover failed: %s", name, e)
-                results[name] = {
+                return name, {
                     "total_spillover": np.nan,
-                    "n_obs": n_obs,
+                    "n_obs": len(sub),
                     "directional_spillovers": None,
                 }
 
-        # Non-crisis period
-        non_crisis = returns.iloc[~crisis_mask]
-        if len(non_crisis) > self._var_lags + self._forecast_horizon + 50:
-            try:
-                analyzer = SpilloverAnalyzer()
-                analyzer.fit(non_crisis, self._var_lags, self._forecast_horizon)
-                results["non_crisis"] = {
-                    "total_spillover": analyzer.total_spillover_index(),
-                    "n_obs": len(non_crisis),
-                    "directional_spillovers": analyzer.directional_spillovers(),
-                }
-            except Exception as e:
-                logger.error("Non-crisis spillover failed: %s", e)
-                results["non_crisis"] = {
-                    "total_spillover": np.nan,
-                    "n_obs": len(non_crisis),
-                    "directional_spillovers": None,
-                }
+        # Run all event analyses in parallel
+        crisis_bar = tqdm(total=len(event_slices), desc="Crisis spillover", unit="event", leave=False)
+
+        with ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, len(event_slices))) as pool:
+            futures = {
+                pool.submit(_analyze_event, name, sub): name
+                for name, sub in event_slices.items()
+            }
+            for future in as_completed(futures):
+                name, result = future.result()
+                results[name] = result
+                crisis_bar.update(1)
+                crisis_bar.set_postfix(event=name[:15])
+
+        crisis_bar.close()
 
         for name, res in results.items():
             logger.info(

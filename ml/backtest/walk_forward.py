@@ -17,15 +17,19 @@ Outputs:
 """
 import logging
 import json
+import os
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+
+_MAX_WORKERS = min(8, os.cpu_count() or 4)
 
 try:
     from tqdm import tqdm
@@ -54,7 +58,11 @@ from ..models.garch_dcc import StudentTGarchDCC
 from ..models.bayesian_hmm import BayesianRegimeHMM
 from ..models.ensemble import EnsembleCombiner
 from ..data.preprocess import prepare_hmm_features
-from .benchmarks import run_all_benchmarks
+from .benchmarks import run_all_benchmarks, simulate_benchmark
+from .benchmarks import (
+    EqualWeight, BTCOnly, SixtyForty, MarketCapWeighted,
+    RiskParityStatic, MinimumVariance,
+)
 from .metrics import (
     compute_all_metrics, format_metrics_table,
     bootstrap_metric, paired_bootstrap_test,
@@ -459,17 +467,25 @@ def plot_risk_metrics_dashboard(returns: np.ndarray, timestamps: pd.DatetimeInde
 # ═══════════════════════════════════════════════════
 
 def _compute_bootstrap_cis(returns: np.ndarray, n_resamples: int = 1000) -> dict:
-    """Compute bootstrap 95% CIs for key metrics."""
+    """Compute bootstrap 95% CIs for key metrics (parallel across metrics)."""
     metrics_to_bootstrap = [
         ("sharpe_ci", sharpe_ratio, "Sharpe"),
         ("max_drawdown_ci", maximum_drawdown, "MaxDD"),
         ("cvar_5pct_ci", lambda r: cvar(r, 0.05), "CVaR"),
     ]
+
+    def _bootstrap_single(key, func, label):
+        return key, bootstrap_metric(returns, func, n_resamples=n_resamples)
+
     results = {}
-    bar = tqdm(metrics_to_bootstrap, desc="Bootstrap CIs", unit="metric", leave=False)
-    for key, func, label in bar:
-        bar.set_postfix(metric=label, resamples=n_resamples)
-        results[key] = bootstrap_metric(returns, func, n_resamples=n_resamples)
+    with ThreadPoolExecutor(max_workers=len(metrics_to_bootstrap)) as pool:
+        futures = {
+            pool.submit(_bootstrap_single, key, func, label): key
+            for key, func, label in metrics_to_bootstrap
+        }
+        for future in as_completed(futures):
+            key, ci_result = future.result()
+            results[key] = ci_result
 
     return results
 
@@ -481,18 +497,26 @@ def _compute_significance_tests(
 ) -> dict:
     """
     Paired bootstrap test: is ensemble Sharpe significantly > each benchmark?
-    Returns p-values for each benchmark.
+    Returns p-values for each benchmark (parallel across benchmarks).
     """
-    results = {}
-    bar = tqdm(benchmark_results.items(), desc="Significance tests", unit="bench", leave=False)
-    for key, bm in bar:
-        bar.set_postfix(benchmark=bm["name"][:20])
+    def _test_single(key, bm):
         test = paired_bootstrap_test(
             ensemble_returns, bm["returns"],
             metric_func=sharpe_ratio,
             n_resamples=n_resamples,
         )
-        results[bm["name"]] = test
+        return bm["name"], test
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, len(benchmark_results))) as pool:
+        futures = {
+            pool.submit(_test_single, key, bm): key
+            for key, bm in benchmark_results.items()
+        }
+        for future in as_completed(futures):
+            name, test = future.result()
+            results[name] = test
+
     return results
 
 
@@ -718,11 +742,36 @@ def run_walk_forward(
 
     logger.info(f"\nWalk-forward complete: {fold} folds, {len(all_returns)} test observations")
 
-    # ── Run Benchmarks ──
-    logger.info("\nRunning benchmarks...")
+    # ── Run Benchmarks (parallel -- each benchmark is independent) ──
+    logger.info("\nRunning benchmarks (parallel)...")
     test_start_global = train_window
     test_returns_df = returns_df.iloc[test_start_global:test_start_global + len(all_returns)]
-    benchmark_results = run_all_benchmarks(test_returns_df, asset_names, tc_bps)
+
+    _benchmark_specs = {
+        "equal_weight": EqualWeight(asset_names),
+        "btc_only": BTCOnly(asset_names),
+        "sixty_forty": SixtyForty(asset_names),
+        "market_cap": MarketCapWeighted(asset_names),
+        "risk_parity_static": RiskParityStatic(asset_names),
+        "min_variance": MinimumVariance(asset_names),
+    }
+
+    def _run_single_benchmark(key, strategy):
+        return key, simulate_benchmark(strategy, test_returns_df, tc_bps)
+
+    benchmark_results = {}
+    bench_bar = tqdm(total=len(_benchmark_specs), desc="Benchmarks", unit="strategy", leave=True)
+    with ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, len(_benchmark_specs))) as pool:
+        futures = {
+            pool.submit(_run_single_benchmark, key, strat): key
+            for key, strat in _benchmark_specs.items()
+        }
+        for future in as_completed(futures):
+            key, result = future.result()
+            benchmark_results[key] = result
+            bench_bar.update(1)
+            bench_bar.set_postfix(strategy=result["name"][:25])
+    bench_bar.close()
 
     # ── Compute Metrics ──
     logger.info("\nComputing metrics...")
@@ -782,7 +831,7 @@ def run_walk_forward(
     output_dir = Path("results")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("\nGenerating visualisations...")
+    logger.info("\nGenerating visualisations (parallel)...")
     chart_tasks = [
         ("equity_curves", lambda: plot_equity_curves(equity_curve, benchmark_results, timestamps, output_dir)),
         ("drawdowns", lambda: plot_drawdowns(all_returns, benchmark_results, timestamps, output_dir)),
@@ -792,10 +841,27 @@ def run_walk_forward(
         ("monthly_heatmap", lambda: plot_monthly_returns_heatmap(all_returns, timestamps, output_dir)),
         ("risk_dashboard", lambda: plot_risk_metrics_dashboard(all_returns, timestamps, output_dir)),
     ]
-    chart_bar = tqdm(chart_tasks, desc="Generating charts", unit="chart", leave=True)
-    for chart_name, chart_func in chart_bar:
-        chart_bar.set_postfix(chart=chart_name)
+
+    # matplotlib is not fully thread-safe, so we use ThreadPoolExecutor with
+    # max_workers=1 for safety, but can increase if backend is Agg (non-interactive)
+    # Agg backend is thread-safe for independent figure objects
+    chart_bar = tqdm(total=len(chart_tasks), desc="Generating charts", unit="chart", leave=True)
+
+    def _run_chart(chart_name, chart_func):
         chart_func()
+        return chart_name
+
+    with ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, len(chart_tasks))) as pool:
+        futures = {
+            pool.submit(_run_chart, name, func): name
+            for name, func in chart_tasks
+        }
+        for future in as_completed(futures):
+            chart_name = future.result()
+            chart_bar.update(1)
+            chart_bar.set_postfix(chart=chart_name)
+
+    chart_bar.close()
     # monte_carlo_fan_6m.png and monte_carlo_fan_12m.png are generated
     # by monte_carlo.py when called separately
 

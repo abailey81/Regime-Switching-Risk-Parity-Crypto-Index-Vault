@@ -18,11 +18,15 @@ Data quality:
 
 import logging
 import json
+import os
 import yaml
 import numpy as np
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
+
+_MAX_WORKERS = min(8, os.cpu_count() or 4)
 
 try:
     from tqdm import tqdm
@@ -185,44 +189,55 @@ def test_stationarity(
     """
     from statsmodels.tsa.stattools import adfuller
 
-    results = {}
-    adf_bar = tqdm(returns_df.columns, desc="ADF Test", unit="asset", leave=False)
-    for col in adf_bar:
+    def _adf_single(col: str) -> Tuple[str, dict]:
+        """Run ADF test on a single column."""
         series = returns_df[col].dropna()
         if len(series) < 30:
             logger.warning(f"  ADF skip {col}: too few observations ({len(series)})")
-            results[col] = {
+            return col, {
                 "statistic": None,
                 "pvalue": None,
                 "is_stationary": None,
                 "lags_used": None,
             }
-            continue
-
         try:
             stat, pval, lags, nobs, crit, icbest = adfuller(series, autolag="AIC")
             is_stat = pval < significance
-            results[col] = {
-                "statistic": round(float(stat), 6),
-                "pvalue": round(float(pval), 6),
-                "is_stationary": bool(is_stat),
-                "lags_used": int(lags),
-            }
-            status_mark = "ok" if is_stat else "FAIL"
-            adf_bar.set_postfix(asset=col, p=f"{pval:.3f}", status=status_mark)
             if not is_stat:
                 logger.warning(
                     f"  ADF: {col} is NON-STATIONARY (p={pval:.4f}). "
                     f"Consider differencing."
                 )
+            return col, {
+                "statistic": round(float(stat), 6),
+                "pvalue": round(float(pval), 6),
+                "is_stationary": bool(is_stat),
+                "lags_used": int(lags),
+            }
         except Exception as e:
             logger.error(f"  ADF failed for {col}: {e}")
-            results[col] = {
+            return col, {
                 "statistic": None,
                 "pvalue": None,
                 "is_stationary": None,
                 "lags_used": None,
             }
+
+    results = {}
+    columns = list(returns_df.columns)
+    adf_bar = tqdm(total=len(columns), desc="ADF Test", unit="asset", leave=False)
+
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+        futures = {pool.submit(_adf_single, col): col for col in columns}
+        for future in as_completed(futures):
+            col, res = future.result()
+            results[col] = res
+            adf_bar.update(1)
+            if res["pvalue"] is not None:
+                status_mark = "ok" if res["is_stationary"] else "FAIL"
+                adf_bar.set_postfix(asset=col, p=f"{res['pvalue']:.3f}", status=status_mark)
+
+    adf_bar.close()
 
     n_stat = sum(1 for v in results.values() if v.get("is_stationary") is True)
     logger.info(
@@ -358,23 +373,22 @@ def compute_features(
     def _wlabel(w):
         return window_labels.get(w, f"{w}h")
 
-    features = {}
     btc_returns = None
     if "BTC" in prices_df.columns:
         btc_returns = np.log(prices_df["BTC"] / prices_df["BTC"].shift(1))
 
-    feat_bar = tqdm(prices_df.columns, desc="Features", unit="asset", leave=False)
-    for col in feat_bar:
-        feat_bar.set_postfix(asset=col)
+    def _compute_asset_features(col: str) -> Dict[Tuple[str, str], pd.Series]:
+        """Compute all features for a single asset. Returns dict of (asset, feature) -> Series."""
+        asset_feats: Dict[Tuple[str, str], pd.Series] = {}
         p = prices_df[col]
         lr = np.log(p / p.shift(1))
 
         # Log returns
-        features[(col, "log_return")] = lr
+        asset_feats[(col, "log_return")] = lr
 
         # Close-to-close realised volatility
         for w in vol_windows:
-            features[(col, f"realised_vol_{_wlabel(w)}")] = (
+            asset_feats[(col, f"realised_vol_{_wlabel(w)}")] = (
                 lr.rolling(w).std() * np.sqrt(8760)
             )
 
@@ -382,12 +396,11 @@ def compute_features(
         if use_parkinson and ohlcv_data and col in ohlcv_data:
             raw = ohlcv_data[col]
             if "high" in raw.columns and "low" in raw.columns:
-                # Reindex to match prices_df
                 h = raw["high"].reindex(p.index)
-                l = raw["low"].reindex(p.index)
+                l_col = raw["low"].reindex(p.index)
                 for w in vol_windows:
-                    features[(col, f"parkinson_vol_{_wlabel(w)}")] = (
-                        parkinson_volatility(h, l, w)
+                    asset_feats[(col, f"parkinson_vol_{_wlabel(w)}")] = (
+                        parkinson_volatility(h, l_col, w)
                     )
 
         # Garman-Klass volatility
@@ -397,58 +410,76 @@ def compute_features(
             if required.issubset(raw.columns):
                 o = raw["open"].reindex(p.index)
                 h = raw["high"].reindex(p.index)
-                l = raw["low"].reindex(p.index)
+                l_col = raw["low"].reindex(p.index)
                 c = raw["close"].reindex(p.index)
                 for w in vol_windows:
-                    features[(col, f"garman_klass_vol_{_wlabel(w)}")] = (
-                        garman_klass_volatility(o, h, l, c, w)
+                    asset_feats[(col, f"garman_klass_vol_{_wlabel(w)}")] = (
+                        garman_klass_volatility(o, h, l_col, c, w)
                     )
 
         # Rolling Sharpe
-        features[(col, f"rolling_sharpe_{_wlabel(sharpe_window)}")] = (
+        asset_feats[(col, f"rolling_sharpe_{_wlabel(sharpe_window)}")] = (
             lr.rolling(sharpe_window).mean() / lr.rolling(sharpe_window).std()
         ) * np.sqrt(8760)
 
         # Momentum
         for w in mom_windows:
-            features[(col, f"momentum_{_wlabel(w)}")] = p / p.shift(w) - 1
+            asset_feats[(col, f"momentum_{_wlabel(w)}")] = p / p.shift(w) - 1
 
         # Rolling skewness
         if use_skew:
             for w in vol_windows:
-                features[(col, f"rolling_skew_{_wlabel(w)}")] = lr.rolling(w).skew()
+                asset_feats[(col, f"rolling_skew_{_wlabel(w)}")] = lr.rolling(w).skew()
 
         # Rolling kurtosis
         if use_kurt:
             for w in vol_windows:
-                features[(col, f"rolling_kurt_{_wlabel(w)}")] = lr.rolling(w).kurt()
+                asset_feats[(col, f"rolling_kurt_{_wlabel(w)}")] = lr.rolling(w).kurt()
 
         # Rolling correlation with BTC (the market factor)
         if btc_returns is not None and col != "BTC":
-            features[(col, f"btc_corr_{_wlabel(corr_window)}")] = (
+            asset_feats[(col, f"btc_corr_{_wlabel(corr_window)}")] = (
                 lr.rolling(corr_window).corr(btc_returns)
             )
 
         # Volume-weighted returns
         if ohlcv_data and col in ohlcv_data and "volume" in ohlcv_data[col].columns:
             vol = ohlcv_data[col]["volume"].reindex(p.index)
-            features[(col, "volume_weighted_return")] = lr * vol
+            asset_feats[(col, "volume_weighted_return")] = lr * vol
 
             # Volume ratio
             for w in vol_windows:
-                features[(col, f"volume_ratio_{_wlabel(w)}")] = (
+                asset_feats[(col, f"volume_ratio_{_wlabel(w)}")] = (
                     vol / vol.rolling(w).mean()
                 )
 
         # Amihud illiquidity
         if use_amihud and ohlcv_data and col in ohlcv_data and "volume" in ohlcv_data[col].columns:
             vol = ohlcv_data[col]["volume"].reindex(p.index)
-            features[(col, "amihud_illiquidity")] = amihud_illiquidity(lr, vol)
+            asset_feats[(col, "amihud_illiquidity")] = amihud_illiquidity(lr, vol)
 
         # Hurst exponent
-        features[(col, "hurst_exponent")] = rolling_hurst_exponent(
+        asset_feats[(col, "hurst_exponent")] = rolling_hurst_exponent(
             lr, window=hurst_window
         )
+
+        return asset_feats
+
+    # Compute per-asset features in parallel (pandas rolling/numpy release the GIL)
+    features: Dict[Tuple[str, str], pd.Series] = {}
+    columns = list(prices_df.columns)
+    feat_bar = tqdm(total=len(columns), desc="Features", unit="asset", leave=False)
+
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+        futures = {pool.submit(_compute_asset_features, col): col for col in columns}
+        for future in as_completed(futures):
+            col = futures[future]
+            asset_feats = future.result()
+            features.update(asset_feats)
+            feat_bar.update(1)
+            feat_bar.set_postfix(asset=col)
+
+    feat_bar.close()
 
     features_df = pd.DataFrame(features, index=prices_df.index)
     features_df.columns = pd.MultiIndex.from_tuples(

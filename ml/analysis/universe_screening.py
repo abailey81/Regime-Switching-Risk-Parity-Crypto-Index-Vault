@@ -701,17 +701,12 @@ class UniverseScreener:
         _safe_log("Stage 4: Applying statistical quality filter...")
 
         initial_count = len(self.liquid_symbols)
-        survivors: List[str] = []
-        removed: Dict[str, str] = {}
-        hurst_flags: Dict[str, float] = {}
 
-        qual_bar = tqdm(self.liquid_symbols, desc="Quality Filter", unit="asset", leave=False)
-        for sym in qual_bar:
-            qual_bar.set_postfix(sym=sym[:8], passed=len(survivors))
+        def _check_quality(sym: str):
+            """Check a single asset's statistical quality. Returns (sym, pass, reason, hurst_flag)."""
             rets = self.returns_data.get(sym)
             if rets is None or len(rets) < 100:
-                removed[sym] = "insufficient_returns"
-                continue
+                return sym, False, "insufficient_returns", None
 
             rets_clean = rets.dropna()
 
@@ -721,24 +716,20 @@ class UniverseScreener:
                 total_expected = len(df)
                 missing_pct = 1.0 - len(rets_clean) / max(total_expected - 1, 1)
                 if missing_pct > 0.05:
-                    removed[sym] = f"missing_data ({missing_pct:.1%})"
-                    continue
+                    return sym, False, f"missing_data ({missing_pct:.1%})", None
 
             # (b) ADF stationarity test on returns
             try:
                 adf_result = adfuller(rets_clean.values, maxlag=14, autolag="AIC")
                 adf_pvalue = adf_result[1]
                 if adf_pvalue > 0.05:
-                    removed[sym] = f"non_stationary (ADF p={adf_pvalue:.4f})"
-                    continue
+                    return sym, False, f"non_stationary (ADF p={adf_pvalue:.4f})", None
             except Exception as e:
                 logger.debug("ADF failed for %s: %s", sym, e)
-                removed[sym] = "adf_failed"
-                continue
+                return sym, False, "adf_failed", None
 
             # (c) Suspicious pattern detection
             if df is not None:
-                # Constant price streaks: more than 5 consecutive identical closes
                 closes = df["close"].values
                 max_streak = 1
                 current_streak = 1
@@ -750,23 +741,44 @@ class UniverseScreener:
                         current_streak = 1
 
                 if max_streak > 20:
-                    removed[sym] = f"constant_price_streak ({max_streak} bars)"
-                    continue
+                    return sym, False, f"constant_price_streak ({max_streak} bars)", None
 
-                # Zero-volume days
                 vol_series = df["volume"]
                 zero_vol_pct = (vol_series == 0).sum() / len(vol_series)
                 if zero_vol_pct > 0.10:
-                    removed[sym] = f"zero_volume ({zero_vol_pct:.1%})"
-                    continue
+                    return sym, False, f"zero_volume ({zero_vol_pct:.1%})", None
 
             # (d) Hurst exponent (flag but keep)
             h = _hurst_exponent(rets_clean.values)
-            if h > 0.7 or h < 0.3:
-                hurst_flags[sym] = h
+            hurst_flag = h if (h > 0.7 or h < 0.3) else None
 
-            survivors.append(sym)
+            return sym, True, None, hurst_flag
 
+        # Run all quality checks in parallel (ADF + Hurst release the GIL)
+        _n_workers = min(8, os.cpu_count() or 4)
+        survivors: List[str] = []
+        removed: Dict[str, str] = {}
+        hurst_flags: Dict[str, float] = {}
+
+        qual_bar = tqdm(total=initial_count, desc="Quality Filter", unit="asset", leave=False)
+
+        with ThreadPoolExecutor(max_workers=_n_workers) as pool:
+            futures = {
+                pool.submit(_check_quality, sym): sym
+                for sym in self.liquid_symbols
+            }
+            for future in as_completed(futures):
+                sym, passed, reason, hurst_flag = future.result()
+                qual_bar.update(1)
+                qual_bar.set_postfix(sym=sym[:8], passed=len(survivors))
+                if passed:
+                    survivors.append(sym)
+                    if hurst_flag is not None:
+                        hurst_flags[sym] = hurst_flag
+                else:
+                    removed[sym] = reason
+
+        qual_bar.close()
         self.quality_symbols = survivors
 
         _safe_log(f"Stage 4: {initial_count} -> {len(survivors)} assets after quality filter")
@@ -816,69 +828,56 @@ class UniverseScreener:
         _safe_log("Stage 5: Computing risk-return profiles...")
 
         rf_annual = self.config.get("risk_free_rate", 0.045)
-        rf_daily = rf_annual / _DAILY_ANN_FACTOR
 
         # Prepare BTC returns as market factor
         if "BTC" in self.returns_data:
             self._btc_returns = self.returns_data["BTC"]
         else:
-            # Find BTC-like symbol
             for candidate in ("BTC", "BTCB", "WBTC"):
                 if candidate in self.returns_data:
                     self._btc_returns = self.returns_data[candidate]
                     break
 
-        profiles: List[dict] = []
+        btc_returns = self._btc_returns  # local ref for thread safety
 
-        profile_bar = tqdm(self.quality_symbols, desc="Profiling", unit="asset", leave=False)
-        for sym in profile_bar:
-            profile_bar.set_postfix(asset=sym[:8])
+        def _profile_single(sym: str) -> Optional[dict]:
+            """Compute all profile metrics for a single asset."""
             rets = self.returns_data.get(sym)
             vol = self.volume_data.get(sym)
             if rets is None or len(rets) < 50:
-                continue
+                return None
 
             rets_arr = rets.values
             clean = rets_arr[np.isfinite(rets_arr)]
             if len(clean) < 50:
-                continue
+                return None
 
-            # Core metrics
             ann_ret = float(np.mean(clean) * _DAILY_ANN_FACTOR)
             ann_vol = float(np.std(clean, ddof=1) * _SQRT_ANN)
             sharpe = float((ann_ret - rf_annual) / ann_vol) if ann_vol > 1e-8 else 0.0
 
-            # Max drawdown
             cum_ret = np.cumsum(clean)
             running_max = np.maximum.accumulate(cum_ret)
             drawdowns = cum_ret - running_max
             max_dd = float(np.min(drawdowns))
 
-            # CVaR
             cvar_5 = _cvar(clean, alpha=0.05)
-
-            # Distribution shape
             skew = float(stats.skew(clean))
             kurt = float(stats.kurtosis(clean))
-
-            # Hurst exponent
             hurst = _hurst_exponent(clean)
 
-            # Amihud illiquidity
             vol_arr = vol.reindex(rets.index).values if vol is not None else np.zeros(len(rets))
             amihud = _amihud_illiquidity(rets_arr, vol_arr)
 
-            # BTC factor analysis
             btc_corr = 0.0
             btc_beta = 0.0
             idio_vol = ann_vol
 
-            if self._btc_returns is not None and sym != "BTC":
-                # Align indices
-                common_idx = rets.index.intersection(self._btc_returns.index)
+            if btc_returns is not None and sym != "BTC":
+                common_idx = rets.index.intersection(btc_returns.index)
                 if len(common_idx) > 50:
                     r_asset = rets.loc[common_idx].values
-                    r_btc = self._btc_returns.loc[common_idx].values
+                    r_btc = btc_returns.loc[common_idx].values
 
                     mask = np.isfinite(r_asset) & np.isfinite(r_btc)
                     if mask.sum() > 50:
@@ -887,17 +886,15 @@ class UniverseScreener:
 
                         btc_corr = float(np.corrcoef(r_a, r_b)[0, 1])
 
-                        # OLS regression: r_asset = alpha + beta * r_btc + epsilon
                         cov_ab = np.cov(r_a, r_b, ddof=1)
                         var_btc = cov_ab[1, 1]
                         if var_btc > 1e-12:
                             btc_beta = float(cov_ab[0, 1] / var_btc)
 
-                        # Idiosyncratic volatility
                         residuals = r_a - btc_beta * r_b
                         idio_vol = float(np.std(residuals, ddof=1) * _SQRT_ANN)
 
-            profiles.append({
+            return {
                 "symbol": sym,
                 "ann_return": round(ann_ret, 6),
                 "ann_volatility": round(ann_vol, 6),
@@ -912,7 +909,28 @@ class UniverseScreener:
                 "btc_beta": round(btc_beta, 4),
                 "idio_volatility": round(idio_vol, 6),
                 "n_observations": len(clean),
-            })
+            }
+
+        # Run all profile computations in parallel (numpy/scipy release the GIL)
+        _n_workers = min(8, os.cpu_count() or 4)
+        profiles: List[dict] = []
+
+        profile_bar = tqdm(total=len(self.quality_symbols), desc="Profiling", unit="asset", leave=False)
+
+        with ThreadPoolExecutor(max_workers=_n_workers) as pool:
+            futures = {
+                pool.submit(_profile_single, sym): sym
+                for sym in self.quality_symbols
+            }
+            for future in as_completed(futures):
+                sym = futures[future]
+                profile_bar.update(1)
+                profile_bar.set_postfix(asset=sym[:8])
+                result = future.result()
+                if result is not None:
+                    profiles.append(result)
+
+        profile_bar.close()
 
         df = pd.DataFrame(profiles)
         if not df.empty:

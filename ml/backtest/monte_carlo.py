@@ -15,14 +15,18 @@ Also provides an alternative t-copula simulation path for comparison.
 """
 import logging
 import json
+import os
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Optional
+
+_MAX_WORKERS = min(8, os.cpu_count() or 4)
 
 try:
     from tqdm import tqdm
@@ -82,7 +86,6 @@ def regime_conditioned_bootstrap(
     Returns:
         simulated_returns: (n_simulations, horizon_hours, n_assets)
     """
-    rng = np.random.RandomState(seed)
     returns = returns_df.values
     T, n_assets = returns.shape
     n_blocks = (horizon_hours + block_size - 1) // block_size  # ceiling division
@@ -106,38 +109,61 @@ def regime_conditioned_bootstrap(
             logger.warning(f"  No blocks for regime {regime_labels[i]}, using all data as fallback")
             regime_indices[i] = all_valid
 
-    simulated = np.zeros((n_simulations, horizon_hours, n_assets))
+    # ── Parallel chunk simulation ──
+    n_workers = min(_MAX_WORKERS, n_simulations)
+    chunk_size = n_simulations // n_workers
+    remainder = n_simulations % n_workers
 
-    sim_bar = tqdm(range(n_simulations), desc="Monte Carlo | Bootstrap", unit="path", leave=False)
-    for sim in sim_bar:
-        # Sample starting regime from stationary distribution (first row)
-        current_regime = rng.choice(3, p=transition_matrix[0])
+    def _simulate_chunk(worker_id, n_chunk_paths, chunk_seed):
+        """Simulate a chunk of MC paths. Thread-safe with independent RNG."""
+        rng = np.random.RandomState(chunk_seed)
+        chunk = np.zeros((n_chunk_paths, horizon_hours, n_assets))
 
-        path_returns = []
-        for block in range(n_blocks):
-            # Sample a block from the current regime
-            valid = regime_indices[current_regime]
-            start_idx = valid[rng.randint(len(valid))]
-            end_idx = min(start_idx + block_size, T)
-            block_data = returns[start_idx:end_idx]
-            path_returns.append(block_data)
+        for sim in range(n_chunk_paths):
+            current_regime = rng.choice(3, p=transition_matrix[0])
+            path_returns = []
 
-            # Transition to next regime
-            current_regime = rng.choice(3, p=transition_matrix[current_regime])
+            for block in range(n_blocks):
+                valid = regime_indices[current_regime]
+                start_idx = valid[rng.randint(len(valid))]
+                end_idx = min(start_idx + block_size, T)
+                block_data = returns[start_idx:end_idx]
+                path_returns.append(block_data)
+                current_regime = rng.choice(3, p=transition_matrix[current_regime])
 
-        path = np.concatenate(path_returns, axis=0)[:horizon_hours]
+            path = np.concatenate(path_returns, axis=0)[:horizon_hours]
 
-        # Pad if necessary (edge case: not enough data)
-        if len(path) < horizon_hours:
-            pad_len = horizon_hours - len(path)
-            pad_start = rng.randint(0, max(1, T - pad_len))
-            pad = returns[pad_start:pad_start + pad_len]
-            if len(pad) < pad_len:
-                pad = np.tile(returns.mean(axis=0), (pad_len, 1))
-            path = np.concatenate([path, pad[:pad_len]], axis=0)
+            if len(path) < horizon_hours:
+                pad_len = horizon_hours - len(path)
+                pad_start = rng.randint(0, max(1, T - pad_len))
+                pad = returns[pad_start:pad_start + pad_len]
+                if len(pad) < pad_len:
+                    pad = np.tile(returns.mean(axis=0), (pad_len, 1))
+                path = np.concatenate([path, pad[:pad_len]], axis=0)
 
-        simulated[sim, :len(path)] = path[:horizon_hours]
+            chunk[sim, :len(path)] = path[:horizon_hours]
 
+        return worker_id, chunk
+
+    sim_bar = tqdm(total=n_workers, desc="Monte Carlo | Bootstrap", unit="chunk", leave=False)
+
+    chunks = [None] * n_workers
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = {}
+        offset = 0
+        for w in range(n_workers):
+            n_paths = chunk_size + (1 if w < remainder else 0)
+            futures[pool.submit(_simulate_chunk, w, n_paths, seed + w)] = w
+            offset += n_paths
+
+        for future in as_completed(futures):
+            worker_id, chunk = future.result()
+            chunks[worker_id] = chunk
+            sim_bar.update(1)
+
+    sim_bar.close()
+
+    simulated = np.concatenate(chunks, axis=0)
     return simulated
 
 
@@ -192,28 +218,47 @@ def t_copula_simulation(
         # Fallback: use diagonal (independent assets)
         L = np.eye(n_assets)
 
-    # Generate t-copula samples
-    portfolio_returns = np.zeros((n_simulations, horizon_hours))
+    # Generate t-copula samples (parallel chunks)
+    n_workers = min(_MAX_WORKERS, n_simulations)
+    chunk_size = n_simulations // n_workers
+    remainder = n_simulations % n_workers
 
-    for sim in tqdm(range(n_simulations), desc="Monte Carlo | t-Copula", unit="path", leave=False):
-        # Draw from multivariate t via: Z = sqrt(df/chi2) * L @ N(0,I)
-        chi2_samples = rng.chisquare(df, size=horizon_hours)
-        normal_samples = rng.randn(horizon_hours, n_assets)
+    def _copula_chunk(worker_id, n_chunk_paths, chunk_seed):
+        """Simulate a chunk of t-copula paths. Thread-safe."""
+        rng_local = np.random.RandomState(chunk_seed)
+        chunk_returns = np.zeros((n_chunk_paths, horizon_hours))
 
-        for h in range(horizon_hours):
-            z = normal_samples[h]
-            correlated = L @ z
-            # Scale by chi-squared for t-distribution
-            t_factor = np.sqrt(df / chi2_samples[h])
-            t_samples = correlated * t_factor
+        for sim in range(n_chunk_paths):
+            chi2_samples = rng_local.chisquare(df, size=horizon_hours)
+            normal_samples = rng_local.randn(horizon_hours, n_assets)
 
-            # Transform through marginals: t-CDF -> uniform -> asset return
-            # Use t-distribution CDF then inverse-normal to get correlated normals
-            # Then scale back to asset returns
-            asset_returns = means + stds * t_samples
+            for h in range(horizon_hours):
+                z = normal_samples[h]
+                correlated = L @ z
+                t_factor = np.sqrt(df / chi2_samples[h])
+                t_samples = correlated * t_factor
+                asset_returns = means + stds * t_samples
+                chunk_returns[sim, h] = np.dot(weights, asset_returns)
 
-            portfolio_returns[sim, h] = np.dot(weights, asset_returns)
+        return worker_id, chunk_returns
 
+    copula_bar = tqdm(total=n_workers, desc="Monte Carlo | t-Copula", unit="chunk", leave=False)
+
+    chunks = [None] * n_workers
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = {}
+        for w in range(n_workers):
+            n_paths = chunk_size + (1 if w < remainder else 0)
+            futures[pool.submit(_copula_chunk, w, n_paths, seed + w * 100)] = w
+
+        for future in as_completed(futures):
+            worker_id, chunk = future.result()
+            chunks[worker_id] = chunk
+            copula_bar.update(1)
+
+    copula_bar.close()
+
+    portfolio_returns = np.concatenate(chunks, axis=0)
     return portfolio_returns
 
 
@@ -279,17 +324,36 @@ def run_monte_carlo(
         # Terminal values
         terminal_values = np.exp(portfolio_returns.sum(axis=1))
 
-        # Max drawdowns per path
-        max_drawdowns = np.array([
-            maximum_drawdown(portfolio_returns[i])
-            for i in tqdm(range(n_sims), desc="  Max drawdowns", unit="path", leave=False)
-        ])
+        # Max drawdowns and Sharpe ratios per path (parallel chunks)
+        def _compute_path_metrics_chunk(start, end):
+            """Compute drawdown and Sharpe for a chunk of paths."""
+            dd_chunk = np.array([maximum_drawdown(portfolio_returns[i]) for i in range(start, end)])
+            sr_chunk = np.array([sharpe_ratio(portfolio_returns[i]) for i in range(start, end)])
+            return start, dd_chunk, sr_chunk
 
-        # Sharpe ratios per path
-        sharpe_ratios = np.array([
-            sharpe_ratio(portfolio_returns[i])
-            for i in tqdm(range(n_sims), desc="  Sharpe ratios", unit="path", leave=False)
-        ])
+        metrics_chunk_size = max(1, n_sims // _MAX_WORKERS)
+        max_drawdowns_parts = [None] * _MAX_WORKERS
+        sharpe_parts = [None] * _MAX_WORKERS
+        n_metric_chunks = 0
+
+        with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+            futures = {}
+            for w in range(_MAX_WORKERS):
+                s = w * metrics_chunk_size
+                e = min(s + metrics_chunk_size, n_sims) if w < _MAX_WORKERS - 1 else n_sims
+                if s >= n_sims:
+                    break
+                futures[pool.submit(_compute_path_metrics_chunk, s, e)] = w
+                n_metric_chunks += 1
+
+            for future in as_completed(futures):
+                start, dd_chunk, sr_chunk = future.result()
+                idx = start // metrics_chunk_size
+                max_drawdowns_parts[idx] = dd_chunk
+                sharpe_parts[idx] = sr_chunk
+
+        max_drawdowns = np.concatenate([p for p in max_drawdowns_parts if p is not None])
+        sharpe_ratios = np.concatenate([p for p in sharpe_parts if p is not None])
 
         # Conditional Tail Expectation (CTE) at 5%
         sorted_terminal = np.sort(terminal_values)

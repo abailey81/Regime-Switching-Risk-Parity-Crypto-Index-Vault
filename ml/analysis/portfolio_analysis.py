@@ -22,13 +22,17 @@ Dependencies: numpy, pandas, scipy, sklearn, statsmodels, warnings, logging.
 """
 
 import logging
+import os
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from scipy import stats
 from scipy.spatial.distance import squareform
+
+_MAX_WORKERS = min(8, os.cpu_count() or 4)
 
 try:
     from tqdm import tqdm
@@ -683,43 +687,53 @@ class PortfolioAnalyzer:
             columns=self.asset_names,
         )
 
-        n_pairs = self.n_assets * (self.n_assets - 1)
+        # Build list of all (src, tgt) pairs for parallel dispatch
+        pairs = [
+            (src, tgt)
+            for i, src in enumerate(self.asset_names)
+            for j, tgt in enumerate(self.asset_names)
+            if i != j
+        ]
+
+        def _test_pair(src_tgt):
+            src, tgt = src_tgt
+            pair_data = self.returns[[tgt, src]].dropna()
+            if len(pair_data) < max_lag + 30:
+                return None
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    results = grangercausalitytests(
+                        pair_data.values, maxlag=max_lag, verbose=False,
+                    )
+                best_lag = 1
+                best_p = 1.0
+                for lag in range(1, max_lag + 1):
+                    if lag not in results:
+                        continue
+                    p_val = results[lag][0]["ssr_ftest"][1]
+                    if p_val < best_p:
+                        best_p = p_val
+                        best_lag = lag
+                if best_p < 0.05:
+                    return (src, tgt, best_lag, float(best_p))
+            except Exception as exc:
+                logger.debug("Granger %s->%s failed: %s", src, tgt, exc)
+            return None
+
+        n_pairs = len(pairs)
         granger_bar = tqdm(total=n_pairs, desc="Granger Causality", unit="pair", leave=False)
 
-        for i, src in enumerate(self.asset_names):
-            for j, tgt in enumerate(self.asset_names):
-                if i == j:
-                    continue
+        with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+            futures = {pool.submit(_test_pair, p): p for p in pairs}
+            for future in as_completed(futures):
                 granger_bar.update(1)
-                granger_bar.set_postfix(pair=f"{src}->{tgt}")
-                pair_data = self.returns[[tgt, src]].dropna()
-                if len(pair_data) < max_lag + 30:
-                    continue
-
-                try:
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        results = grangercausalitytests(
-                            pair_data.values, maxlag=max_lag, verbose=False,
-                        )
-
-                    # Find the lag with the smallest p-value
-                    best_lag = 1
-                    best_p = 1.0
-                    for lag in range(1, max_lag + 1):
-                        if lag not in results:
-                            continue
-                        p_val = results[lag][0]["ssr_ftest"][1]
-                        if p_val < best_p:
-                            best_p = p_val
-                            best_lag = lag
-
-                    if best_p < 0.05:
-                        edges.append((src, tgt, best_lag, float(best_p)))
-                        adj.loc[src, tgt] = 1.0
-
-                except Exception as exc:
-                    logger.debug("Granger %s->%s failed: %s", src, tgt, exc)
+                result = future.result()
+                if result is not None:
+                    src, tgt, best_lag, best_p = result
+                    edges.append(result)
+                    adj.loc[src, tgt] = 1.0
+                    granger_bar.set_postfix(pair=f"{src}->{tgt}")
 
         granger_bar.close()
 
@@ -764,41 +778,35 @@ class PortfolioAnalyzer:
         ]
 
         source = self.prices if self.prices is not None else self.returns
-        pair_results = []
 
-        for a, b in tqdm(default_pairs, desc="Cointegration tests", unit="pair", leave=False):
+        def _test_pair(a, b):
             if a not in source.columns or b not in source.columns:
-                pair_results.append({
+                return {
                     "pair": f"{a}-{b}",
                     "trace_stat": np.nan,
                     "critical_value_5pct": np.nan,
                     "is_cointegrated": False,
                     "rank": 0,
                     "interpretation": f"Asset(s) missing: {a} or {b}",
-                })
-                continue
+                }
 
             pair_data = source[[a, b]].dropna()
             if len(pair_data) < 100:
-                pair_results.append({
+                return {
                     "pair": f"{a}-{b}",
                     "trace_stat": np.nan,
                     "critical_value_5pct": np.nan,
                     "is_cointegrated": False,
                     "rank": 0,
                     "interpretation": f"Insufficient data ({len(pair_data)} rows).",
-                })
-                continue
+                }
 
             try:
-                # det_order=-1: no constant in cointegrating relation
-                # k_ar_diff=2: 2 lags of first differences
                 result = coint_johansen(pair_data.values, det_order=0, k_ar_diff=2)
 
-                trace_stat = float(result.lr1[0])  # first (r=0) trace statistic
-                crit_5 = float(result.cvt[0, 1])   # 5% critical value
+                trace_stat = float(result.lr1[0])
+                crit_5 = float(result.cvt[0, 1])
 
-                # Cointegration rank: count rejections
                 rank = 0
                 for r in range(len(result.lr1)):
                     if result.lr1[r] > result.cvt[r, 1]:
@@ -826,26 +834,40 @@ class PortfolioAnalyzer:
                         f"cv_5%={crit_5:.2f}, rank={rank})."
                     )
 
-                pair_results.append({
+                logger.info("Cointegration %s-%s: %s", a, b, interp)
+                return {
                     "pair": f"{a}-{b}",
                     "trace_stat": round(trace_stat, 4),
                     "critical_value_5pct": round(crit_5, 4),
                     "is_cointegrated": is_coint,
                     "rank": rank,
                     "interpretation": interp,
-                })
-                logger.info("Cointegration %s-%s: %s", a, b, interp)
+                }
 
             except Exception as exc:
-                pair_results.append({
+                logger.warning("Cointegration %s-%s failed: %s", a, b, exc)
+                return {
                     "pair": f"{a}-{b}",
                     "trace_stat": np.nan,
                     "critical_value_5pct": np.nan,
                     "is_cointegrated": False,
                     "rank": 0,
                     "interpretation": f"Johansen test failed: {exc}",
-                })
-                logger.warning("Cointegration %s-%s failed: %s", a, b, exc)
+                }
+
+        # Run all pair tests in parallel
+        pair_results = []
+        with ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, len(default_pairs))) as pool:
+            futures = {
+                pool.submit(_test_pair, a, b): (a, b)
+                for a, b in default_pairs
+            }
+            for future in as_completed(futures):
+                pair_results.append(future.result())
+
+        # Preserve original pair ordering
+        pair_order = {f"{a}-{b}": idx for idx, (a, b) in enumerate(default_pairs)}
+        pair_results.sort(key=lambda r: pair_order.get(r["pair"], 999))
 
         return {"pairs": pair_results}
 
@@ -1127,8 +1149,18 @@ class PortfolioAnalyzer:
     ) -> dict:
         """Run ALL portfolio analyses and return a combined results dict.
 
+        Analyses are grouped into parallel batches where possible.
         Each analysis is wrapped in a try/except so that a single failure
         does not abort the remaining tests.
+
+        Batch 1 (independent):   spanning_test, eigenvalue_analysis,
+                                  shrinkage_comparison, correlation_network
+        Batch 2 (needs regime):  regime_conditional_correlations,
+                                  rolling_absorption_ratio
+        Batch 3 (needs returns): tail_dependence_analysis,
+                                  granger_causality_network,
+                                  cointegration_analysis
+        Sequential:               diversification_benefit, optimal_n_analysis
 
         Parameters
         ----------
@@ -1142,84 +1174,122 @@ class PortfolioAnalyzer:
         """
         results: Dict[str, object] = {}
 
-        analysis_steps = [
-            ("spanning_tests", "Mean-Variance Spanning Tests", None),
-            ("diversification_benefit", "Diversification Benefit Decomposition", None),
-            ("optimal_n", "Optimal-N Analysis", None),
-            ("regime_correlations", "Regime-Conditional Correlations", None),
-            ("tail_dependence", "Copula Tail Dependence", None),
-            ("eigenvalue_analysis", "Eigenvalue Decomposition / RMT", None),
-            ("granger_causality", "Granger Causality Network", None),
-            ("cointegration", "Johansen Cointegration", None),
-            ("shrinkage_comparison", "Covariance Shrinkage Comparison", None),
-            ("absorption_ratio", "Rolling Absorption Ratio", None),
-            ("correlation_network", "Correlation Network (MST)", None),
-        ]
-
-        analysis_bar = tqdm(analysis_steps, desc="Portfolio Analysis", unit="test", leave=True)
-
-        for step_key, step_name, _ in analysis_bar:
-            step_idx = analysis_steps.index((step_key, step_name, _)) + 1
-            analysis_bar.set_description(
-                f"Portfolio Analysis | {step_idx}/11 [{step_name[:25]}]"
-            )
-
-            logger.info("=" * 60)
-            logger.info("[%d/11] %s", step_idx, step_name)
-            logger.info("=" * 60)
-
+        def _safe_run(name, fn, *args, **kwargs):
+            """Run a single analysis, catching exceptions."""
             try:
-                if step_key == "spanning_tests":
-                    base = ["BTC", "ETH", "SOL"]
-                    test_candidates = ["stETH", "rETH", "BUIDL", "USDY", "USDC"]
-                    spanning = {}
-                    for asset in test_candidates:
-                        if asset in self.asset_names:
-                            spanning[asset] = self.spanning_test(base, [asset])
-                    full_test = [a for a in test_candidates if a in self.asset_names]
-                    if full_test:
-                        spanning["full_3v8"] = self.spanning_test(base, full_test)
-                    results[step_key] = spanning
-
-                elif step_key == "diversification_benefit":
-                    results[step_key] = self.diversification_benefit()
-
-                elif step_key == "optimal_n":
-                    results[step_key] = self.optimal_n_analysis()
-
-                elif step_key == "regime_correlations":
-                    if regime_labels is not None:
-                        results[step_key] = self.regime_conditional_correlations(
-                            regime_labels
-                        )
-                    else:
-                        logger.info("No regime labels provided — skipping regime correlations")
-                        results[step_key] = {"skipped": "no regime_labels"}
-
-                elif step_key == "tail_dependence":
-                    results[step_key] = self.tail_dependence_analysis()
-
-                elif step_key == "eigenvalue_analysis":
-                    results[step_key] = self.eigenvalue_analysis()
-
-                elif step_key == "granger_causality":
-                    results[step_key] = self.granger_causality_network()
-
-                elif step_key == "cointegration":
-                    results[step_key] = self.cointegration_analysis()
-
-                elif step_key == "shrinkage_comparison":
-                    results[step_key] = self.shrinkage_comparison()
-
-                elif step_key == "absorption_ratio":
-                    results[step_key] = self.rolling_absorption_ratio()
-
-                elif step_key == "correlation_network":
-                    results[step_key] = self.correlation_network()
-
+                return fn(*args, **kwargs)
             except Exception as exc:
-                logger.error("%s failed: %s", step_name, exc)
-                results[step_key] = {"error": str(exc)}
+                logger.error("%s failed: %s", name, exc)
+                return {"error": str(exc)}
+
+        # ── Batch 1: No dependencies — run 4 analyses in parallel ────────
+        logger.info("=" * 60)
+        logger.info("Batch 1/5: Independent analyses (4 parallel)")
+        logger.info("=" * 60)
+
+        def _spanning_tests():
+            base = ["BTC", "ETH", "SOL"]
+            test_candidates = ["stETH", "rETH", "BUIDL", "USDY", "USDC"]
+            spanning = {}
+            # Run individual spanning tests in parallel
+            available = [a for a in test_candidates if a in self.asset_names]
+            with ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, len(available) + 1)) as span_pool:
+                span_futures = {
+                    span_pool.submit(self.spanning_test, base, [asset]): asset
+                    for asset in available
+                }
+                full_test = available
+                if full_test:
+                    span_futures[span_pool.submit(self.spanning_test, base, full_test)] = "full_3v8"
+                for fut in as_completed(span_futures):
+                    key = span_futures[fut]
+                    spanning[key] = fut.result()
+            return spanning
+
+        batch1_tasks = {
+            "spanning_tests": ("Mean-Variance Spanning Tests", _spanning_tests),
+            "eigenvalue_analysis": ("Eigenvalue Decomposition / RMT", self.eigenvalue_analysis),
+            "shrinkage_comparison": ("Covariance Shrinkage Comparison", self.shrinkage_comparison),
+            "correlation_network": ("Correlation Network (MST)", self.correlation_network),
+        }
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {
+                pool.submit(_safe_run, name, fn): key
+                for key, (name, fn) in batch1_tasks.items()
+            }
+            for future in as_completed(futures):
+                key = futures[future]
+                results[key] = future.result()
+                logger.info("  [Batch 1] %s done", batch1_tasks[key][0])
+
+        # ── Batch 2: Regime-dependent — run 2 analyses in parallel ───────
+        logger.info("=" * 60)
+        logger.info("Batch 2/5: Regime-dependent analyses (2 parallel)")
+        logger.info("=" * 60)
+
+        batch2_tasks = {}
+        if regime_labels is not None:
+            batch2_tasks["regime_correlations"] = (
+                "Regime-Conditional Correlations",
+                lambda: self.regime_conditional_correlations(regime_labels),
+            )
+        else:
+            logger.info("No regime labels provided — skipping regime correlations")
+            results["regime_correlations"] = {"skipped": "no regime_labels"}
+
+        batch2_tasks["absorption_ratio"] = (
+            "Rolling Absorption Ratio",
+            self.rolling_absorption_ratio,
+        )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = {
+                pool.submit(_safe_run, name, fn): key
+                for key, (name, fn) in batch2_tasks.items()
+            }
+            for future in as_completed(futures):
+                key = futures[future]
+                results[key] = future.result()
+                logger.info("  [Batch 2] %s done", batch2_tasks[key][0])
+
+        # ── Batch 3: Returns-heavy — run 3 analyses in parallel ──────────
+        logger.info("=" * 60)
+        logger.info("Batch 3/5: Returns-heavy analyses (3 parallel)")
+        logger.info("=" * 60)
+
+        batch3_tasks = {
+            "tail_dependence": ("Copula Tail Dependence", self.tail_dependence_analysis),
+            "granger_causality": ("Granger Causality Network", self.granger_causality_network),
+            "cointegration": ("Johansen Cointegration", self.cointegration_analysis),
+        }
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = {
+                pool.submit(_safe_run, name, fn): key
+                for key, (name, fn) in batch3_tasks.items()
+            }
+            for future in as_completed(futures):
+                key = futures[future]
+                results[key] = future.result()
+                logger.info("  [Batch 3] %s done", batch3_tasks[key][0])
+
+        # ── Sequential: State-modifying analyses ─────────────────────────
+        logger.info("=" * 60)
+        logger.info("Batch 4-5/5: Sequential analyses")
+        logger.info("=" * 60)
+
+        results["diversification_benefit"] = _safe_run(
+            "Diversification Benefit Decomposition",
+            self.diversification_benefit,
+        )
+        logger.info("  [Sequential] Diversification Benefit done")
+
+        results["optimal_n"] = _safe_run(
+            "Optimal-N Analysis",
+            self.optimal_n_analysis,
+        )
+        logger.info("  [Sequential] Optimal-N Analysis done")
 
         # ── Summary ──────────────────────────────────────────────────────
         n_ok = sum(1 for v in results.values()
