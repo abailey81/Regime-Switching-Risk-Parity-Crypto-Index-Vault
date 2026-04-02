@@ -52,7 +52,7 @@
 | **Vault Address** | `0x_TO_BE_UPDATED_AFTER_DEPLOYMENT` |
 | **Share Token** | rpCRYPTO (ERC-20 via ERC-4626) |
 | **Underlying** | USDC |
-| **Total Code** | 12,381 lines across 18 Python + 4 Solidity + 4 JS files |
+| **Total Code** | 16,576 lines across 30 Python + 4 Solidity + 4 JS files |
 
 ---
 
@@ -203,6 +203,8 @@ Combines all three model outputs through a multi-stage pipeline:
 | **4. CVaR-constrained optimisation** | Enforces vol target, min/max weights, turnover limits |
 | **5. Circuit breaker** | 15% drawdown from HWM $\rightarrow$ immediate defensive allocation |
 
+Kalman Filter pair tracking validates stETH/ETH and rETH/ETH relationships (mean beta 0.998, tracking error < 0.1%).
+
 </td></tr>
 </table>
 
@@ -332,6 +334,20 @@ Redemption Fee (0.3% within 7 days)
 | Node.js | 18+ | Hardhat, Solidity compilation |
 | Python | 3.10+ | ML pipeline |
 | VS Code | Latest | Development + Colab extension |
+
+## Data & API Requirements
+
+| Service | Required? | Cost | Purpose |
+|:---|:---|:---|:---|
+| Alchemy (Sepolia RPC) | Yes | Free tier | Deploy & interact with smart contract |
+| MetaMask wallet | Yes | Free | Testnet deployment key |
+| Etherscan API | Optional | Free tier | Contract verification |
+| Binance | No key needed | Public API | OHLCV price data via ccxt |
+| CoinGecko | No key needed | Public API | Market cap data for universe screening |
+
+All ML pipeline data comes from public APIs. No paid subscriptions required.
+
+---
 
 ### 1. Smart Contracts
 
@@ -472,6 +488,10 @@ The backtest evaluates performance across **12 major crypto crises** (2020–202
 <td>HRP avoids matrix inversion; robust to noise</td>
 </tr>
 <tr>
+<td>Contagion risk</td>
+<td>Diebold-Yilmaz spillover index monitors shock propagation; spikes above 80% trigger defensive rotation</td>
+</tr>
+<tr>
 <td rowspan="2"><strong>Oracle</strong></td>
 <td>Price manipulation via flash loans</td>
 <td>TWAP oracle; Chainlink staleness check</td>
@@ -536,25 +556,30 @@ Regime-Switching-Risk-Parity-Crypto-Index-Vault/
 ├── test/
 │   └── RiskParityVault.test.js           30+ tests, 809 lines (fees, epochs, circuit breaker, Merkle)
 │
-├── ml/                                 Python ML pipeline (9,532 lines)
+├── ml/                                 Python ML pipeline (13,739 lines)
 │   ├── config.yaml                       ALL hyperparameters (single source of truth)
 │   ├── data/
 │   │   ├── fetch_data.py                 Binance OHLCV + synthetic Treasury/stablecoin
-│   │   └── preprocess.py                 Feature engineering (returns, vol, momentum, Sharpe)
+│   │   ├── preprocess.py                 Feature engineering (returns, vol, momentum, Sharpe)
+│   │   └── cache_manager.py              SHA-256 verified parquet cache with TTL expiry
 │   ├── models/
 │   │   ├── garch_dcc.py                  Student-t GARCH(1,1)-DCC covariance
 │   │   ├── bayesian_hmm.py               3-state HMM with soft posteriors
 │   │   ├── sac_agent.py                  SAC RL agent (train on Colab, infer on CPU)
 │   │   ├── ensemble.py                   Meta-model: Kelly + multi-method + CVaR
-│   │   ├── portfolio_optimizer.py        7 methods: HRP, RP, BL, MVO, InvVol, MaxDiv, CVaR
-│   │   ├── risk_analyzer.py              VaR/CVaR (3 methods), drawdown, BTC correlation
-│   │   └── correlation_analyzer.py       EWMA correlation, regime detection, breakdown alerts
+│   │   ├── portfolio_optimizer.py        8 methods: HRP, RP, BL, MVO, InvVol, MaxDiv, MinVar, CVaR
+│   │   ├── risk_analyzer.py              VaR/CVaR (4 methods), drawdown, BTC correlation
+│   │   ├── correlation_analyzer.py       EWMA correlation, regime detection, breakdown alerts
+│   │   └── kalman_tracker.py             Kalman pair tracking (stETH/ETH, rETH/ETH hedge ratios)
+│   ├── analysis/
+│   │   ├── portfolio_analysis.py         Post-hoc portfolio analytics and reporting
+│   │   └── universe_screening.py         CoinGecko market cap screening for asset selection
 │   ├── environment/
-│   │   └── portfolio_env.py              Custom Gymnasium env (38-dim state, composite reward)
+│   │   └── portfolio_env.py              Custom Gymnasium env (48-dim state, composite reward)
 │   ├── backtest/
 │   │   ├── walk_forward.py               Walk-forward engine + 9 auto-generated charts
 │   │   ├── monte_carlo.py                10K-path regime-conditioned block bootstrap
-│   │   ├── benchmarks.py                 4 comparison strategies
+│   │   ├── benchmarks.py                 6 comparison strategies
 │   │   ├── metrics.py                    18+ metrics (Sharpe, Omega, Ulcer, CVaR, Burke, ...)
 │   │   ├── transaction_costs.py          Venue-specific costs (verified Q1 2026)
 │   │   └── crisis_events.py              12 crypto crises with stratified analysis
@@ -563,7 +588,9 @@ Regime-Switching-Risk-Parity-Crypto-Index-Vault/
 │   │   ├── merkle.py                     Keccak-256 commitment tree
 │   │   └── publish.py                    Web3.py keeper: commit → timelock → execute
 │   └── notebooks/
-│       └── train_sac.ipynb               Colab GPU training notebook
+│       ├── train_sac.ipynb               Colab GPU training notebook
+│       ├── universe_screening.ipynb      Interactive universe screening analysis
+│       └── portfolio_analysis.ipynb      Post-backtest portfolio analytics
 │
 ├── docs/
 │   ├── ARCHITECTURE.md                   System design, data flow, fee mechanics

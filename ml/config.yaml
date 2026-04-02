@@ -109,3 +109,34 @@ backtest:
   step_size: 720
   transaction_cost_bps: 10
   monte_carlo_sims: 10000
+
+screening:
+  top_n: 50                         # Candidates from CoinGecko market cap ranking
+  final_n: 8                        # Final portfolio constituents
+  lookback_days: 365                # Minimum history required
+  min_daily_volume_usd: 10000000    # $10M daily volume floor
+  min_market_cap_usd: 500000000     # $500M market cap floor
+  exclude_stablecoins: true         # Auto-exclude stablecoins from screening (added manually)
+  correlation_max: 0.95             # Drop assets too correlated with existing constituents
+  data_source: "coingecko"          # Market cap data source
+
+attribution:
+  enabled: true
+  method: "brinson"                 # brinson | factor | both
+  risk_free_rate: 0.045             # Annual risk-free rate for attribution
+  factor_model: "pca"              # pca | macro
+  n_factors: 3                      # Number of PCA factors
+  rolling_window: 720               # 30-day rolling attribution window
+
+spillover:
+  var_lags: 4                       # VAR model lag order for Diebold-Yilmaz
+  forecast_horizon: 10              # Generalised forecast error variance horizon
+  rolling_window: 720               # Rolling window for dynamic spillover index
+  crisis_threshold: 0.80            # Total connectedness above this triggers alert
+
+kalman:
+  process_noise: 0.001              # Q diagonal: state transition noise
+  observation_noise: 0.01           # R: observation noise variance
+  initial_beta: 1.0                 # Prior for hedge ratio (stETH/ETH ≈ 1.0)
+  initial_alpha: 0.0                # Prior for intercept
+  initial_state_cov: 1.0            # Initial uncertainty in state estimate

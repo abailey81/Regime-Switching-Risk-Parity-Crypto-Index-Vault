@@ -4,12 +4,15 @@ artifacts/
 typechain-types/
 ml/venv/
 ml/data/cache/
+!ml/data/cache/.gitkeep
 __pycache__/
 *.py[cod]
 ml/models/saved/*.pt
 ml/models/saved/*.zip
 ml/models/saved/*.pkl
 !ml/models/saved/.gitkeep
+ml/results/
+!ml/results/.gitkeep
 .env
 .env.local
 .vscode/settings.json
@@ -20,6 +23,7 @@ coverage/
 dashboard/dist/
 dashboard/node_modules/
 *.log
+# Internal planning & brief
 master_plan_v2.md
 Individual Coursework*.docx
 .claude/
