@@ -30,6 +30,12 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable=None, *a, **kw):
+        return iterable if iterable is not None else range(0)
+
 from .portfolio_optimizer import MultiMethodOptimizer
 
 logger = logging.getLogger(__name__)
@@ -154,12 +160,26 @@ class EnsembleCombiner:
           - Regime transition smoothing
           - Model contribution tracking
         """
+        pipeline_steps = [
+            "HWM update",
+            "Circuit breaker",
+            "Regime-blended risk budget",
+            "Multi-method optimizer",
+            "Inverse-variance combination",
+            "Kelly confidence scaling",
+            "CVaR-constrained optimisation",
+        ]
+        pbar = tqdm(total=len(pipeline_steps), desc="Ensemble", unit="step", leave=True)
+
         # ═══ 1. HWM UPDATE ═══
+        pbar.set_postfix(step="HWM update")
         if current_nav > self.high_water_mark:
             self.high_water_mark = current_nav
         logger.debug("NAV=%.4f  HWM=%.4f", current_nav, self.high_water_mark)
+        pbar.update(1)
 
         # ═══ 2. CIRCUIT BREAKER ═══
+        pbar.set_postfix(step="Circuit breaker")
         drawdown = 1.0 - current_nav / self.high_water_mark if self.high_water_mark > 0 else 0
 
         if drawdown >= self.cb_threshold and not self.circuit_breaker_active:
@@ -173,10 +193,13 @@ class EnsembleCombiner:
             else:
                 defensive = np.array([self.defensive_weights.get(a, 0) for a in self.asset_names])
                 defensive = defensive / defensive.sum()
+                pbar.close()
                 return self._build_result(defensive, "crisis (CB)", hmm_regime_probs,
                                           True, {"defensive": 1.0}, drawdown)
+        pbar.update(1)
 
         # ═══ 3. REGIME-BLENDED RISK BUDGET ═══
+        pbar.set_postfix(step="Regime-blended risk budget")
         p_bull, p_normal, p_crisis = hmm_regime_probs
         dominant = ["bull", "normal", "crisis"][np.argmax(hmm_regime_probs)]
         logger.info(
@@ -193,8 +216,10 @@ class EnsembleCombiner:
             )
 
         budget_weights = self._budget_to_weights(blended)
+        pbar.update(1)
 
         # ═══ 4. MULTI-METHOD GARCH WEIGHTS ═══
+        pbar.set_postfix(step=f"Multi-method optimizer [{optimization_method}]")
         corr = covariance_matrix / np.outer(
             np.sqrt(np.maximum(np.diag(covariance_matrix), 1e-12)),
             np.sqrt(np.maximum(np.diag(covariance_matrix), 1e-12))
@@ -229,8 +254,10 @@ class EnsembleCombiner:
         else:
             logger.info("Optimization method: pass-through (garch_rp_weights)")
             opt_weights = garch_rp_weights
+        pbar.update(1)
 
         # ═══ 5. INVERSE-VARIANCE COMBINATION ═══
+        pbar.set_postfix(step="Inverse-variance combination")
         uncertainties = np.array([
             max(garch_uncertainty, 1e-6),
             max(hmm_uncertainty, 1e-6),
@@ -251,8 +278,10 @@ class EnsembleCombiner:
 
         # ═══ 5b. REGIME TRANSITION SMOOTHING ═══
         combined = self._smooth_regime_transition(combined, dominant)
+        pbar.update(1)
 
         # ═══ 6. KELLY CONFIDENCE SCALING ═══
+        pbar.set_postfix(step="Kelly confidence scaling")
         # Dynamic Kelly fraction from rolling Sharpe
         kelly_frac = self._dynamic_kelly_fraction(returns_df)
 
@@ -273,8 +302,10 @@ class EnsembleCombiner:
         equal_weight = np.ones(self.n_assets) / self.n_assets
         combined = kelly_scale * combined + (1 - kelly_scale) * equal_weight
         combined = combined / combined.sum()
+        pbar.update(1)
 
         # ═══ 7. CVaR-CONSTRAINED OPTIMISATION ═══
+        pbar.set_postfix(step="CVaR-constrained optimisation")
         final = self.optimizer.cvar_constrained(
             combined, covariance_matrix, current_weights
         )
@@ -284,6 +315,8 @@ class EnsembleCombiner:
 
         # ═══ 8. TRACK CONTRIBUTION HISTORY ═══
         self._record_contribution(contributions)
+        pbar.update(1)
+        pbar.close()
 
         return self._build_result(final, dominant, hmm_regime_probs,
                                   False, contributions, drawdown,

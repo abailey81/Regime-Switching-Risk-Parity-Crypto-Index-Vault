@@ -30,6 +30,29 @@ import pandas as pd
 from scipy import stats
 from scipy.spatial.distance import squareform
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    class tqdm:
+        """Minimal tqdm fallback that supports iteration and no-op methods."""
+        def __init__(self, iterable=None, *a, **kw):
+            self._iterable = iterable
+            self.total = kw.get("total", None)
+        def __iter__(self):
+            return iter(self._iterable if self._iterable is not None else [])
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+        def update(self, n=1):
+            pass
+        def set_postfix(self, **kw):
+            pass
+        def set_description(self, desc):
+            pass
+        def close(self):
+            pass
+
 logger = logging.getLogger(__name__)
 
 # ── Default asset-class mapping ──────────────────────────────────────────────
@@ -325,6 +348,7 @@ class PortfolioAnalyzer:
             "marginal_improvement": 0.0,
         })
 
+        opt_n_bar = tqdm(total=len(available), desc="Optimal N", unit="asset", leave=False)
         while available:
             best_asset = None
             best_vol = np.inf
@@ -342,6 +366,12 @@ class PortfolioAnalyzer:
             cvar_now = self._eq_weight_cvar(selected)
             improvement = (vol_prev - best_vol) / vol_prev * 100.0 if vol_prev > 0 else 0.0
 
+            opt_n_bar.update(1)
+            opt_n_bar.set_description(
+                f"Optimal N | Adding asset {len(selected)}/{self.n_assets}"
+            )
+            opt_n_bar.set_postfix(asset=best_asset, vol=f"{best_vol:.4f}")
+
             rows.append({
                 "n_assets": len(selected),
                 "assets": ",".join(selected),
@@ -351,6 +381,7 @@ class PortfolioAnalyzer:
                 "marginal_improvement": round(improvement, 4),
             })
             vol_prev = best_vol
+        opt_n_bar.close()
 
         df = pd.DataFrame(rows)
         logger.info("Optimal-N analysis:\n%s", df[["n_assets", "portfolio_vol", "marginal_improvement"]].to_string(index=False))
@@ -652,10 +683,15 @@ class PortfolioAnalyzer:
             columns=self.asset_names,
         )
 
+        n_pairs = self.n_assets * (self.n_assets - 1)
+        granger_bar = tqdm(total=n_pairs, desc="Granger Causality", unit="pair", leave=False)
+
         for i, src in enumerate(self.asset_names):
             for j, tgt in enumerate(self.asset_names):
                 if i == j:
                     continue
+                granger_bar.update(1)
+                granger_bar.set_postfix(pair=f"{src}->{tgt}")
                 pair_data = self.returns[[tgt, src]].dropna()
                 if len(pair_data) < max_lag + 30:
                     continue
@@ -684,6 +720,8 @@ class PortfolioAnalyzer:
 
                 except Exception as exc:
                     logger.debug("Granger %s->%s failed: %s", src, tgt, exc)
+
+        granger_bar.close()
 
         # Hub = most outgoing edges; reactive = most incoming
         outgoing = adj.sum(axis=1)
@@ -728,7 +766,7 @@ class PortfolioAnalyzer:
         source = self.prices if self.prices is not None else self.returns
         pair_results = []
 
-        for a, b in default_pairs:
+        for a, b in tqdm(default_pairs, desc="Cointegration tests", unit="pair", leave=False):
             if a not in source.columns or b not in source.columns:
                 pair_results.append({
                     "pair": f"{a}-{b}",
@@ -927,7 +965,7 @@ class PortfolioAnalyzer:
         ratios = []
         indices = []
 
-        for end in range(window, self.T):
+        for end in tqdm(range(window, self.T), desc="Absorption ratio", unit="window", leave=False):
             start = end - window
             sub = self.returns.values[start:end]
             corr = np.corrcoef(sub, rowvar=False)
@@ -1104,134 +1142,84 @@ class PortfolioAnalyzer:
         """
         results: Dict[str, object] = {}
 
-        # ── 1. Spanning tests ────────────────────────────────────────────
-        logger.info("=" * 60)
-        logger.info("[1/11] Mean-Variance Spanning Tests")
-        logger.info("=" * 60)
-        try:
-            base = ["BTC", "ETH", "SOL"]
-            test_candidates = ["stETH", "rETH", "BUIDL", "USDY", "USDC"]
+        analysis_steps = [
+            ("spanning_tests", "Mean-Variance Spanning Tests", None),
+            ("diversification_benefit", "Diversification Benefit Decomposition", None),
+            ("optimal_n", "Optimal-N Analysis", None),
+            ("regime_correlations", "Regime-Conditional Correlations", None),
+            ("tail_dependence", "Copula Tail Dependence", None),
+            ("eigenvalue_analysis", "Eigenvalue Decomposition / RMT", None),
+            ("granger_causality", "Granger Causality Network", None),
+            ("cointegration", "Johansen Cointegration", None),
+            ("shrinkage_comparison", "Covariance Shrinkage Comparison", None),
+            ("absorption_ratio", "Rolling Absorption Ratio", None),
+            ("correlation_network", "Correlation Network (MST)", None),
+        ]
 
-            spanning = {}
-            for asset in test_candidates:
-                if asset in self.asset_names:
-                    spanning[asset] = self.spanning_test(base, [asset])
+        analysis_bar = tqdm(analysis_steps, desc="Portfolio Analysis", unit="test", leave=True)
 
-            # Full 3 vs 8
-            full_test = [a for a in test_candidates if a in self.asset_names]
-            if full_test:
-                spanning["full_3v8"] = self.spanning_test(base, full_test)
+        for step_key, step_name, _ in analysis_bar:
+            step_idx = analysis_steps.index((step_key, step_name, _)) + 1
+            analysis_bar.set_description(
+                f"Portfolio Analysis | {step_idx}/11 [{step_name[:25]}]"
+            )
 
-            results["spanning_tests"] = spanning
-        except Exception as exc:
-            logger.error("Spanning tests failed: %s", exc)
-            results["spanning_tests"] = {"error": str(exc)}
+            logger.info("=" * 60)
+            logger.info("[%d/11] %s", step_idx, step_name)
+            logger.info("=" * 60)
 
-        # ── 2. Diversification benefit ───────────────────────────────────
-        logger.info("=" * 60)
-        logger.info("[2/11] Diversification Benefit Decomposition")
-        logger.info("=" * 60)
-        try:
-            results["diversification_benefit"] = self.diversification_benefit()
-        except Exception as exc:
-            logger.error("Diversification benefit failed: %s", exc)
-            results["diversification_benefit"] = {"error": str(exc)}
+            try:
+                if step_key == "spanning_tests":
+                    base = ["BTC", "ETH", "SOL"]
+                    test_candidates = ["stETH", "rETH", "BUIDL", "USDY", "USDC"]
+                    spanning = {}
+                    for asset in test_candidates:
+                        if asset in self.asset_names:
+                            spanning[asset] = self.spanning_test(base, [asset])
+                    full_test = [a for a in test_candidates if a in self.asset_names]
+                    if full_test:
+                        spanning["full_3v8"] = self.spanning_test(base, full_test)
+                    results[step_key] = spanning
 
-        # ── 3. Optimal-N ─────────────────────────────────────────────────
-        logger.info("=" * 60)
-        logger.info("[3/11] Optimal-N Analysis")
-        logger.info("=" * 60)
-        try:
-            results["optimal_n"] = self.optimal_n_analysis()
-        except Exception as exc:
-            logger.error("Optimal-N failed: %s", exc)
-            results["optimal_n"] = {"error": str(exc)}
+                elif step_key == "diversification_benefit":
+                    results[step_key] = self.diversification_benefit()
 
-        # ── 4. Regime-conditional correlations ───────────────────────────
-        logger.info("=" * 60)
-        logger.info("[4/11] Regime-Conditional Correlations")
-        logger.info("=" * 60)
-        try:
-            if regime_labels is not None:
-                results["regime_correlations"] = self.regime_conditional_correlations(
-                    regime_labels
-                )
-            else:
-                logger.info("No regime labels provided — skipping regime correlations")
-                results["regime_correlations"] = {"skipped": "no regime_labels"}
-        except Exception as exc:
-            logger.error("Regime correlations failed: %s", exc)
-            results["regime_correlations"] = {"error": str(exc)}
+                elif step_key == "optimal_n":
+                    results[step_key] = self.optimal_n_analysis()
 
-        # ── 5. Tail dependence ───────────────────────────────────────────
-        logger.info("=" * 60)
-        logger.info("[5/11] Copula Tail Dependence")
-        logger.info("=" * 60)
-        try:
-            results["tail_dependence"] = self.tail_dependence_analysis()
-        except Exception as exc:
-            logger.error("Tail dependence failed: %s", exc)
-            results["tail_dependence"] = {"error": str(exc)}
+                elif step_key == "regime_correlations":
+                    if regime_labels is not None:
+                        results[step_key] = self.regime_conditional_correlations(
+                            regime_labels
+                        )
+                    else:
+                        logger.info("No regime labels provided — skipping regime correlations")
+                        results[step_key] = {"skipped": "no regime_labels"}
 
-        # ── 6. Eigenvalue analysis ───────────────────────────────────────
-        logger.info("=" * 60)
-        logger.info("[6/11] Eigenvalue Decomposition / RMT")
-        logger.info("=" * 60)
-        try:
-            results["eigenvalue_analysis"] = self.eigenvalue_analysis()
-        except Exception as exc:
-            logger.error("Eigenvalue analysis failed: %s", exc)
-            results["eigenvalue_analysis"] = {"error": str(exc)}
+                elif step_key == "tail_dependence":
+                    results[step_key] = self.tail_dependence_analysis()
 
-        # ── 7. Granger causality ─────────────────────────────────────────
-        logger.info("=" * 60)
-        logger.info("[7/11] Granger Causality Network")
-        logger.info("=" * 60)
-        try:
-            results["granger_causality"] = self.granger_causality_network()
-        except Exception as exc:
-            logger.error("Granger causality failed: %s", exc)
-            results["granger_causality"] = {"error": str(exc)}
+                elif step_key == "eigenvalue_analysis":
+                    results[step_key] = self.eigenvalue_analysis()
 
-        # ── 8. Cointegration ─────────────────────────────────────────────
-        logger.info("=" * 60)
-        logger.info("[8/11] Johansen Cointegration")
-        logger.info("=" * 60)
-        try:
-            results["cointegration"] = self.cointegration_analysis()
-        except Exception as exc:
-            logger.error("Cointegration failed: %s", exc)
-            results["cointegration"] = {"error": str(exc)}
+                elif step_key == "granger_causality":
+                    results[step_key] = self.granger_causality_network()
 
-        # ── 9. Shrinkage comparison ──────────────────────────────────────
-        logger.info("=" * 60)
-        logger.info("[9/11] Covariance Shrinkage Comparison")
-        logger.info("=" * 60)
-        try:
-            results["shrinkage_comparison"] = self.shrinkage_comparison()
-        except Exception as exc:
-            logger.error("Shrinkage comparison failed: %s", exc)
-            results["shrinkage_comparison"] = {"error": str(exc)}
+                elif step_key == "cointegration":
+                    results[step_key] = self.cointegration_analysis()
 
-        # ── 10. Absorption ratio ─────────────────────────────────────────
-        logger.info("=" * 60)
-        logger.info("[10/11] Rolling Absorption Ratio")
-        logger.info("=" * 60)
-        try:
-            results["absorption_ratio"] = self.rolling_absorption_ratio()
-        except Exception as exc:
-            logger.error("Absorption ratio failed: %s", exc)
-            results["absorption_ratio"] = {"error": str(exc)}
+                elif step_key == "shrinkage_comparison":
+                    results[step_key] = self.shrinkage_comparison()
 
-        # ── 11. Correlation network ──────────────────────────────────────
-        logger.info("=" * 60)
-        logger.info("[11/11] Correlation Network (MST)")
-        logger.info("=" * 60)
-        try:
-            results["correlation_network"] = self.correlation_network()
-        except Exception as exc:
-            logger.error("Correlation network failed: %s", exc)
-            results["correlation_network"] = {"error": str(exc)}
+                elif step_key == "absorption_ratio":
+                    results[step_key] = self.rolling_absorption_ratio()
+
+                elif step_key == "correlation_network":
+                    results[step_key] = self.correlation_network()
+
+            except Exception as exc:
+                logger.error("%s failed: %s", step_name, exc)
+                results[step_key] = {"error": str(exc)}
 
         # ── Summary ──────────────────────────────────────────────────────
         n_ok = sum(1 for v in results.values()

@@ -26,6 +26,12 @@ from arch import arch_model
 from scipy import stats as sp_stats
 from scipy.optimize import minimize
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable=None, *a, **kw):
+        return iterable if iterable is not None else range(0)
+
 logger = logging.getLogger(__name__)
 
 
@@ -90,7 +96,9 @@ class StudentTGarchDCC:
         conditional_vols = pd.DataFrame(index=returns_df.index, columns=assets, dtype=float)
         std_resids = pd.DataFrame(index=returns_df.index, columns=assets, dtype=float)
 
-        for col in assets:
+        asset_bar = tqdm(assets, desc="Fitting GARCH", unit="asset", leave=True)
+        for col in asset_bar:
+            asset_bar.set_postfix(asset=col)
             series = returns_df[col].dropna() * 100  # Scale to percentage for numerical stability
 
             if self.enable_model_selection:
@@ -161,7 +169,10 @@ class StudentTGarchDCC:
         bic_scores: Dict[str, float] = {}
         results: Dict[str, object] = {}
 
-        for name, kwargs in candidates.items():
+        model_bar = tqdm(candidates.items(), desc=f"Model selection | {asset}",
+                         unit="model", leave=False, total=len(candidates))
+        for name, kwargs in model_bar:
+            model_bar.set_postfix(model=name)
             result, _ = self._fit_single_garch(series, asset, name, **kwargs)
             if result is not None:
                 bic_scores[name] = result.bic
@@ -356,6 +367,10 @@ class StudentTGarchDCC:
         logger.info(f"  DCC init (method of moments): a={a_init:.4f}, b={b_init:.4f}")
 
         # QML estimation of a, b
+        # Use a manual tqdm bar for DCC likelihood evaluations
+        _dcc_eval_count = [0]
+        _dcc_bar = tqdm(total=0, desc="DCC estimation", unit="eval", leave=False)
+
         def neg_log_likelihood(params):
             a, b = params
             if a < 0 or b < 0 or a + b >= 1:
@@ -383,6 +398,12 @@ class StudentTGarchDCC:
                 except np.linalg.LinAlgError:
                     return 1e10
 
+            _dcc_eval_count[0] += 1
+            _dcc_bar.total = _dcc_eval_count[0]
+            _dcc_bar.n = _dcc_eval_count[0]
+            _dcc_bar.set_postfix(a=f"{a:.4f}", b=f"{b:.4f}", nll=f"{-ll:.1f}")
+            _dcc_bar.refresh()
+
             return -ll
 
         result = minimize(
@@ -391,6 +412,8 @@ class StudentTGarchDCC:
             bounds=[(1e-6, 0.3), (0.5, 0.9999)],
             method="L-BFGS-B",
         )
+
+        _dcc_bar.close()
 
         a_est, b_est = result.x[0], result.x[1]
 
@@ -619,7 +642,9 @@ class StudentTGarchDCC:
         param_samples: Dict[str, List[np.ndarray]] = {col: [] for col in returns_df.columns}
         cov_forecasts: List[np.ndarray] = []
 
-        for b in range(n_samples):
+        n_valid = 0
+        boot_bar = tqdm(range(n_samples), desc="Bootstrap", unit="sample", leave=True)
+        for b in boot_bar:
             # Block bootstrap index
             n_blocks = n_obs // block_size + 1
             starts = np.random.randint(0, n_obs - block_size, size=n_blocks)
@@ -639,8 +664,10 @@ class StudentTGarchDCC:
                         param_samples[col].append(boot_model.garch_results[col].params.values)
 
                 cov_forecasts.append(boot_model.forecast_covariance())
+                n_valid += 1
             except Exception:
                 continue  # Skip failed bootstrap samples
+            boot_bar.set_postfix(valid=n_valid, failed=b + 1 - n_valid)
 
         # Compute confidence intervals
         for col, samples in param_samples.items():
@@ -737,7 +764,7 @@ class StudentTGarchDCC:
             try:
                 se_sum += res.std_err.mean()
                 count += 1
-            except:
+            except (AttributeError, ValueError):
                 pass
         return se_sum / max(count, 1)
 

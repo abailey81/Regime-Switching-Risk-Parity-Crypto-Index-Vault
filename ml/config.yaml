@@ -109,6 +109,9 @@ backtest:
   step_size: 720
   transaction_cost_bps: 10
   monte_carlo_sims: 10000
+  bootstrap_resamples: 1000              # Bootstrap CI resamples for metrics
+  portfolio_value_usd: 1000000           # Assumed portfolio NAV for cost model
+  block_size: 168                        # Monte Carlo block bootstrap size (hours)
 
 screening:
   top_n: 50                         # Candidates from CoinGecko market cap ranking

@@ -20,6 +20,12 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable=None, *a, **kw):
+        return iterable if iterable is not None else range(0)
+
 logger = logging.getLogger(__name__)
 
 
@@ -228,7 +234,9 @@ class SACAllocator:
         # --- Train each seed ---
         seed_results: List[Tuple[int, float, dict, object]] = []
 
-        for seed in range(self.n_seeds):
+        seed_bar = tqdm(range(self.n_seeds), desc="SAC Training", unit="seed", leave=True)
+        for seed in seed_bar:
+            seed_bar.set_postfix(seed=f"{seed + 1}/{self.n_seeds}")
             logger.info(f"\n  Seed {seed + 1}/{self.n_seeds}...")
 
             # Create training environment
@@ -300,6 +308,12 @@ class SACAllocator:
                 f"maxDD={eval_metrics['max_drawdown']:.3f}, "
                 f"CVaR5%={eval_metrics['cvar_5pct']:.4f}, "
                 f"total_return={eval_metrics['total_return']:.4f}"
+            )
+
+            seed_bar.set_postfix(
+                seed=f"{seed + 1}/{self.n_seeds}",
+                Sharpe=f"{eval_metrics['sharpe']:.3f}",
+                maxDD=f"{eval_metrics['max_drawdown']:.3f}",
             )
 
             seed_results.append((seed, eval_metrics["sharpe"], eval_metrics, model))
@@ -444,12 +458,15 @@ class SACAllocator:
         # Try to load ensemble models
         model_dir = Path(model_path).parent
         ensemble_loaded = 0
-        for i in range(self.n_seeds):
+        load_bar = tqdm(range(self.n_seeds), desc="Loading ensemble seeds",
+                        unit="seed", leave=False)
+        for i in load_bar:
             seed_path = model_dir / f"sac_seed_{i}"
             if seed_path.with_suffix(".zip").exists():
                 try:
                     self.ensemble_models.append(SAC.load(str(seed_path)))
                     ensemble_loaded += 1
+                    load_bar.set_postfix(loaded=ensemble_loaded)
                 except Exception:
                     pass
         if ensemble_loaded > 0:
@@ -598,5 +615,5 @@ class SACAllocator:
             ent_coef = self.model.ent_coef_tensor.item()
             # Higher ent_coef means the policy is more exploratory = more uncertain
             return min(abs(ent_coef), 1.0)
-        except:
+        except (AttributeError, RuntimeError):
             return 0.5  # Default moderate uncertainty

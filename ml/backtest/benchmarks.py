@@ -14,6 +14,29 @@ import pandas as pd
 import logging
 from typing import Optional
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    class tqdm:
+        """Minimal tqdm fallback that supports iteration and no-op methods."""
+        def __init__(self, iterable=None, *a, **kw):
+            self._iterable = iterable
+            self.total = kw.get("total", None)
+        def __iter__(self):
+            return iter(self._iterable if self._iterable is not None else [])
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+        def update(self, n=1):
+            pass
+        def set_postfix(self, **kw):
+            pass
+        def set_description(self, desc):
+            pass
+        def close(self):
+            pass
+
 logger = logging.getLogger(__name__)
 
 
@@ -305,7 +328,9 @@ def run_all_benchmarks(returns_df: pd.DataFrame, asset_names: list,
     }
 
     results = {}
-    for key, strategy in benchmarks.items():
+    bench_bar = tqdm(benchmarks.items(), desc="Benchmarks", unit="strategy", leave=True)
+    for key, strategy in bench_bar:
+        bench_bar.set_postfix(strategy=strategy.name[:25])
         logger.info(f"  Simulating {strategy.name}...")
         results[key] = simulate_benchmark(strategy, returns_df, tc_bps)
 

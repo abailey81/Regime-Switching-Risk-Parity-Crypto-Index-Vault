@@ -27,6 +27,29 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    class tqdm:
+        """Minimal tqdm fallback that supports iteration and no-op methods."""
+        def __init__(self, iterable=None, *a, **kw):
+            self._iterable = iterable
+            self.total = kw.get("total", None)
+        def __iter__(self):
+            return iter(self._iterable if self._iterable is not None else [])
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+        def update(self, n=1):
+            pass
+        def set_postfix(self, **kw):
+            pass
+        def set_description(self, desc):
+            pass
+        def close(self):
+            pass
+
 from ..models.garch_dcc import StudentTGarchDCC
 from ..models.bayesian_hmm import BayesianRegimeHMM
 from ..models.ensemble import EnsembleCombiner
@@ -437,19 +460,18 @@ def plot_risk_metrics_dashboard(returns: np.ndarray, timestamps: pd.DatetimeInde
 
 def _compute_bootstrap_cis(returns: np.ndarray, n_resamples: int = 1000) -> dict:
     """Compute bootstrap 95% CIs for key metrics."""
-    ci_sharpe = bootstrap_metric(returns, sharpe_ratio, n_resamples=n_resamples)
-    ci_mdd = bootstrap_metric(returns, maximum_drawdown, n_resamples=n_resamples)
-    ci_cvar = bootstrap_metric(
-        returns,
-        lambda r: cvar(r, 0.05),
-        n_resamples=n_resamples,
-    )
+    metrics_to_bootstrap = [
+        ("sharpe_ci", sharpe_ratio, "Sharpe"),
+        ("max_drawdown_ci", maximum_drawdown, "MaxDD"),
+        ("cvar_5pct_ci", lambda r: cvar(r, 0.05), "CVaR"),
+    ]
+    results = {}
+    bar = tqdm(metrics_to_bootstrap, desc="Bootstrap CIs", unit="metric", leave=False)
+    for key, func, label in bar:
+        bar.set_postfix(metric=label, resamples=n_resamples)
+        results[key] = bootstrap_metric(returns, func, n_resamples=n_resamples)
 
-    return {
-        "sharpe_ci": ci_sharpe,
-        "max_drawdown_ci": ci_mdd,
-        "cvar_5pct_ci": ci_cvar,
-    }
+    return results
 
 
 def _compute_significance_tests(
@@ -462,7 +484,9 @@ def _compute_significance_tests(
     Returns p-values for each benchmark.
     """
     results = {}
-    for key, bm in benchmark_results.items():
+    bar = tqdm(benchmark_results.items(), desc="Significance tests", unit="bench", leave=False)
+    for key, bm in bar:
+        bar.set_postfix(benchmark=bm["name"][:20])
         test = paired_bootstrap_test(
             ensemble_returns, bm["returns"],
             metric_func=sharpe_ratio,
@@ -546,12 +570,26 @@ def run_walk_forward(
     cumulative_return = 0.0
     high_water_mark = 1.0
 
+    # Pre-compute total folds for progress bar
+    total_folds = 0
+    _t = 0
+    while _t + train_window + test_window <= n_total:
+        total_folds += 1
+        _t += step_size
+    fold_bar = tqdm(total=total_folds, desc="Walk-Forward", unit="fold", leave=True)
+
     while t + train_window + test_window <= n_total:
         fold += 1
         train_start = t
         train_end = t + train_window
         test_start = train_end
         test_end = min(train_end + test_window, n_total)
+
+        # Update fold progress bar with date range
+        train_date = str(returns_df.index[train_start].date()) if hasattr(returns_df.index[train_start], 'date') else str(train_start)
+        test_date = str(returns_df.index[min(test_end - 1, n_total - 1)].date()) if hasattr(returns_df.index[min(test_end - 1, n_total - 1)], 'date') else str(test_end)
+        fold_bar.set_description(f"Walk-Forward | Fold {fold}/{total_folds}")
+        fold_bar.set_postfix(train=train_date, test=test_date)
 
         logger.info(f"\n  Fold {fold}: train [{train_start}:{train_end}], "
                     f"test [{test_start}:{test_end}]")
@@ -669,6 +707,9 @@ def run_walk_forward(
             current_weights = new_weights
 
         t += step_size
+        fold_bar.update(1)
+
+    fold_bar.close()
 
     # ── Convert to arrays ──
     all_returns = np.array(all_returns)
@@ -742,13 +783,19 @@ def run_walk_forward(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("\nGenerating visualisations...")
-    plot_equity_curves(equity_curve, benchmark_results, timestamps, output_dir)
-    plot_drawdowns(all_returns, benchmark_results, timestamps, output_dir)
-    plot_regime_timeline(all_regimes, timestamps, output_dir)
-    plot_weight_evolution(all_weights, asset_names, timestamps, output_dir)
-    plot_rolling_sharpe(all_returns, benchmark_results, timestamps, output_dir)
-    plot_monthly_returns_heatmap(all_returns, timestamps, output_dir)
-    plot_risk_metrics_dashboard(all_returns, timestamps, output_dir)
+    chart_tasks = [
+        ("equity_curves", lambda: plot_equity_curves(equity_curve, benchmark_results, timestamps, output_dir)),
+        ("drawdowns", lambda: plot_drawdowns(all_returns, benchmark_results, timestamps, output_dir)),
+        ("regime_timeline", lambda: plot_regime_timeline(all_regimes, timestamps, output_dir)),
+        ("weight_evolution", lambda: plot_weight_evolution(all_weights, asset_names, timestamps, output_dir)),
+        ("rolling_sharpe", lambda: plot_rolling_sharpe(all_returns, benchmark_results, timestamps, output_dir)),
+        ("monthly_heatmap", lambda: plot_monthly_returns_heatmap(all_returns, timestamps, output_dir)),
+        ("risk_dashboard", lambda: plot_risk_metrics_dashboard(all_returns, timestamps, output_dir)),
+    ]
+    chart_bar = tqdm(chart_tasks, desc="Generating charts", unit="chart", leave=True)
+    for chart_name, chart_func in chart_bar:
+        chart_bar.set_postfix(chart=chart_name)
+        chart_func()
     # monte_carlo_fan_6m.png and monte_carlo_fan_12m.png are generated
     # by monte_carlo.py when called separately
 

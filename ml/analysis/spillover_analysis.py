@@ -29,6 +29,29 @@ import numpy as np
 import pandas as pd
 from scipy import linalg
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    class tqdm:
+        """Minimal tqdm fallback that supports iteration and no-op methods."""
+        def __init__(self, iterable=None, *a, **kw):
+            self._iterable = iterable
+            self.total = kw.get("total", None)
+        def __iter__(self):
+            return iter(self._iterable if self._iterable is not None else [])
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+        def update(self, n=1):
+            pass
+        def set_postfix(self, **kw):
+            pass
+        def set_description(self, desc):
+            pass
+        def close(self):
+            pass
+
 logger = logging.getLogger(__name__)
 
 
@@ -239,8 +262,11 @@ class SpilloverAnalyzer:
 
         # Step through with stride = window // 10 for efficiency
         stride = max(1, win // 10)
+        n_windows = len(range(win, T, stride))
 
-        for end in range(win, T, stride):
+        roll_bar = tqdm(range(win, T, stride), desc="Rolling Spillover", unit="window",
+                        total=n_windows, leave=False)
+        for end in roll_bar:
             start = end - win
             sub = returns.iloc[start:end]
             try:
@@ -256,6 +282,8 @@ class SpilloverAnalyzer:
 
             indices.append(returns.index[end - 1])
             values.append(tsi)
+            if not np.isnan(tsi):
+                roll_bar.set_postfix(SI=f"{tsi:.1f}%")
 
         result = pd.Series(values, index=indices, name="rolling_spillover")
 
@@ -296,7 +324,7 @@ class SpilloverAnalyzer:
 
         crisis_mask = np.zeros(len(returns), dtype=bool)
 
-        for event in crisis_events:
+        for event in tqdm(crisis_events, desc="Crisis spillover", unit="event", leave=False):
             name = event.get("name", "unnamed")
             start = pd.to_datetime(event.get("start"))
             end = pd.to_datetime(event.get("end"))
@@ -513,7 +541,10 @@ class SpilloverAnalyzer:
         # Theta_ij(H) = generalised FEVD element
         theta = np.zeros((n, n))
 
-        for i in range(n):
+        fevd_bar = tqdm(range(n), desc="FEVD computation", unit="asset", leave=False) if n > 3 else range(n)
+        for i in fevd_bar:
+            if hasattr(fevd_bar, 'set_postfix'):
+                fevd_bar.set_postfix(target=i)
             for j in range(n):
                 numerator = 0.0
                 denominator = 0.0

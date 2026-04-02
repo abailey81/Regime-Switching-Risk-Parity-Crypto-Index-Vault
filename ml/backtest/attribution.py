@@ -29,6 +29,29 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    class tqdm:
+        """Minimal tqdm fallback that supports iteration and no-op methods."""
+        def __init__(self, iterable=None, *a, **kw):
+            self._iterable = iterable
+            self.total = kw.get("total", None)
+        def __iter__(self):
+            return iter(self._iterable if self._iterable is not None else [])
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+        def update(self, n=1):
+            pass
+        def set_postfix(self, **kw):
+            pass
+        def set_description(self, desc):
+            pass
+        def close(self):
+            pass
+
 logger = logging.getLogger(__name__)
 
 # Default asset-class mapping (mirrors config.yaml risk_budgets)
@@ -170,14 +193,25 @@ class PerformanceAttributor:
         bench_ret = float(np.exp(np.sum(self._benchmark_returns)) - 1)
         excess = total_ret - bench_ret
 
+        attr_steps = [
+            ("Asset class attribution", lambda: self.asset_class_attribution()),
+            ("Regime attribution", lambda: self.regime_attribution()),
+            ("Risk management value", lambda: self.risk_management_value()),
+        ]
+        attr_results = {}
+        attr_bar = tqdm(attr_steps, desc="Attribution pipeline", unit="step", leave=False)
+        for step_name, step_func in attr_bar:
+            attr_bar.set_postfix(step=step_name[:25])
+            attr_results[step_name] = step_func()
+
         results = {
             "total_return": total_ret,
             "benchmark_return": bench_ret,
             "excess_return": excess,
             "n_periods": T,
-            "asset_class_attribution": self.asset_class_attribution(),
-            "regime_attribution": self.regime_attribution(),
-            "risk_management_value": self.risk_management_value(),
+            "asset_class_attribution": attr_results["Asset class attribution"],
+            "regime_attribution": attr_results["Regime attribution"],
+            "risk_management_value": attr_results["Risk management value"],
             "fee_drag": float(np.sum(self._fee_history)),
             "cost_drag": float(np.sum(self._cost_history)),
         }
@@ -473,7 +507,7 @@ class PerformanceAttributor:
         interact_total = 0.0
         by_class: Dict[str, Dict[str, float]] = {}
 
-        for cls_name, cls_assets in self.asset_classes.items():
+        for cls_name, cls_assets in tqdm(self.asset_classes.items(), desc="Brinson attribution", unit="class", leave=False):
             indices = [
                 self.asset_names.index(a)
                 for a in cls_assets
@@ -570,8 +604,9 @@ class PerformanceAttributor:
         rows = []
         # Use stride for efficiency on large datasets
         stride = max(1, window // 10)
+        n_windows = len(range(window, T, stride))
 
-        for end in range(window, T, stride):
+        for end in tqdm(range(window, T, stride), desc="Rolling attribution", unit="window", total=n_windows, leave=False):
             start = end - window
             port_ret = self._portfolio_returns[start:end]
             bench_ret = self._benchmark_returns[start:end]

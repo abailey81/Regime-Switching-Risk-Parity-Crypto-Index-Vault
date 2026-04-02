@@ -24,6 +24,29 @@ import seaborn as sns
 from pathlib import Path
 from typing import Dict, Optional
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    class tqdm:
+        """Minimal tqdm fallback that supports iteration and no-op methods."""
+        def __init__(self, iterable=None, *a, **kw):
+            self._iterable = iterable
+            self.total = kw.get("total", None)
+        def __iter__(self):
+            return iter(self._iterable if self._iterable is not None else [])
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+        def update(self, n=1):
+            pass
+        def set_postfix(self, **kw):
+            pass
+        def set_description(self, desc):
+            pass
+        def close(self):
+            pass
+
 from .metrics import maximum_drawdown, sharpe_ratio, cvar, annualised_return
 
 logger = logging.getLogger(__name__)
@@ -85,7 +108,8 @@ def regime_conditioned_bootstrap(
 
     simulated = np.zeros((n_simulations, horizon_hours, n_assets))
 
-    for sim in range(n_simulations):
+    sim_bar = tqdm(range(n_simulations), desc="Monte Carlo | Bootstrap", unit="path", leave=False)
+    for sim in sim_bar:
         # Sample starting regime from stationary distribution (first row)
         current_regime = rng.choice(3, p=transition_matrix[0])
 
@@ -171,7 +195,7 @@ def t_copula_simulation(
     # Generate t-copula samples
     portfolio_returns = np.zeros((n_simulations, horizon_hours))
 
-    for sim in range(n_simulations):
+    for sim in tqdm(range(n_simulations), desc="Monte Carlo | t-Copula", unit="path", leave=False):
         # Draw from multivariate t via: Z = sqrt(df/chi2) * L @ N(0,I)
         chi2_samples = rng.chisquare(df, size=horizon_hours)
         normal_samples = rng.randn(horizon_hours, n_assets)
@@ -236,7 +260,7 @@ def run_monte_carlo(
 
     all_results = {}
 
-    for horizon in horizons:
+    for horizon in tqdm(horizons, desc="MC Horizons", unit="horizon", leave=True):
         label = f"{horizon // (24 * 30)}m"  # "6m" or "12m"
         logger.info(f"\nMonte Carlo: {n_sims} paths x {horizon}h ({label})...")
 
@@ -257,12 +281,14 @@ def run_monte_carlo(
 
         # Max drawdowns per path
         max_drawdowns = np.array([
-            maximum_drawdown(portfolio_returns[i]) for i in range(n_sims)
+            maximum_drawdown(portfolio_returns[i])
+            for i in tqdm(range(n_sims), desc="  Max drawdowns", unit="path", leave=False)
         ])
 
         # Sharpe ratios per path
         sharpe_ratios = np.array([
-            sharpe_ratio(portfolio_returns[i]) for i in range(n_sims)
+            sharpe_ratio(portfolio_returns[i])
+            for i in tqdm(range(n_sims), desc="  Sharpe ratios", unit="path", leave=False)
         ])
 
         # Conditional Tail Expectation (CTE) at 5%

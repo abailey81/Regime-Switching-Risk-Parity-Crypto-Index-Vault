@@ -52,7 +52,7 @@
 | **Vault Address** | `0x5D859aDf4b23316C00D3e0c8B7bEAf9f6ea52596` |
 | **Share Token** | rpCRYPTO (ERC-20 via ERC-4626) |
 | **Underlying** | USDC |
-| **Total Code** | 16,576 lines across 30 Python + 4 Solidity + 4 JS files |
+| **Total Code** | 18,592 lines across 32 Python + 4 Solidity + 4 JS files |
 
 ---
 
@@ -178,7 +178,7 @@ Classifies the market into **bull / normal / crisis** using hidden Markov chains
 
 `ml/models/sac_agent.py` + `ml/environment/portfolio_env.py`
 
-Soft Actor-Critic agent trained on a custom Gymnasium environment (38-dim state) with composite reward function:
+Soft Actor-Critic agent trained on a custom Gymnasium environment (48-dim state) with composite reward function:
 
 $$R = \lambda_1 \cdot r_t - \lambda_2 \cdot \max(0,\ \text{CVaR}_{5\%} - 2\%) - \lambda_3 \cdot \max(0,\ \text{DD} - 10\%) - \lambda_4 \cdot \|\Delta w\|_1$$
 
@@ -358,7 +358,7 @@ npm install
 cp .env.example .env          # Fill in RPC URL + private key
 
 npx hardhat compile            # Compile contracts
-npx hardhat test               # Run 30+ tests
+npx hardhat test               # Run 57 tests
 
 npx hardhat run scripts/deploy_mocks.js --network sepolia   # Deploy test tokens
 npx hardhat run scripts/deploy.js --network sepolia          # Deploy vault
@@ -543,50 +543,73 @@ Regime-Switching-Risk-Parity-Crypto-Index-Vault/
 ├── contracts/                          Solidity (1,641 lines)
 │   ├── RiskParityVault.sol               Core ERC-4626 vault (1,294 lines)
 │   ├── mocks/
-│   │   ├── MockERC20.sol                 Mintable test tokens with faucet
-│   │   └── MockPriceFeed.sol             Simulated Chainlink (TWAP + history)
+│   │   ├── MockERC20.sol                 Mintable test tokens with faucet (43 lines)
+│   │   └── MockPriceFeed.sol             Simulated Chainlink (TWAP + history) (282 lines)
 │   └── interfaces/
-│       └── IChainlinkAggregator.sol      Oracle interface
+│       └── IChainlinkAggregator.sol      Oracle interface (22 lines)
 │
 ├── scripts/                            Deployment & interaction (387 lines)
-│   ├── deploy_mocks.js                   Deploy 8 test tokens + 8 price feeds
-│   ├── deploy.js                         Deploy vault, register constituents
-│   └── interact.js                       Full lifecycle: deposit → rebalance → withdraw
+│   ├── deploy_mocks.js                   Deploy 8 test tokens + 8 price feeds (114 lines)
+│   ├── deploy.js                         Deploy vault, register constituents (120 lines)
+│   └── interact.js                       Full lifecycle: deposit → rebalance → withdraw (153 lines)
 │
 ├── test/
-│   └── RiskParityVault.test.js           30+ tests, 809 lines (fees, epochs, circuit breaker, Merkle)
+│   └── RiskParityVault.test.js           57 tests, 809 lines (fees, epochs, circuit breaker, Merkle)
 │
-├── ml/                                 Python ML pipeline (13,739 lines)
-│   ├── config.yaml                       ALL hyperparameters (single source of truth)
+├── ml/                                 Python ML pipeline (15,755 lines)
+│   ├── config.yaml                       ALL hyperparameters — single source of truth (145 lines)
 │   ├── data/
-│   │   ├── fetch_data.py                 Binance OHLCV + synthetic Treasury/stablecoin
-│   │   ├── preprocess.py                 Feature engineering (returns, vol, momentum, Sharpe)
-│   │   └── cache_manager.py              SHA-256 verified parquet cache with TTL expiry
+│   │   ├── fetch_data.py                 Binance OHLCV + synthetic Treasury/stablecoin (1,219 lines)
+│   │   │                                   Adaptive rate limiter, circuit breaker retry, parallel fetching
+│   │   ├── preprocess.py                 Feature engineering: returns, vol (Parkinson, GK), (796 lines)
+│   │   │                                   momentum, Sharpe, Hurst, Amihud illiquidity, cross-asset PCA
+│   │   └── cache_manager.py              SHA-256 content-addressed cache with TTL expiry (620 lines)
+│   │                                       Config-aware invalidation, atomic writes, file-based locking
 │   ├── models/
-│   │   ├── garch_dcc.py                  Student-t GARCH(1,1)-DCC covariance
-│   │   ├── bayesian_hmm.py               3-state HMM with soft posteriors
-│   │   ├── sac_agent.py                  SAC RL agent (train on Colab, infer on CPU)
-│   │   ├── ensemble.py                   Meta-model: Kelly + multi-method + CVaR
-│   │   ├── portfolio_optimizer.py        8 methods: HRP, RP, BL, MVO, InvVol, MaxDiv, MinVar, CVaR
-│   │   ├── risk_analyzer.py              VaR/CVaR (4 methods), drawdown, BTC correlation
-│   │   ├── correlation_analyzer.py       EWMA correlation, regime detection, breakdown alerts
-│   │   └── kalman_tracker.py             Kalman pair tracking (stETH/ETH, rETH/ETH hedge ratios)
+│   │   ├── garch_dcc.py                  Student-t GARCH(1,1)-DCC covariance (797 lines)
+│   │   │                                   Model selection (GARCH/EGARCH/GJR via BIC), bootstrap CIs
+│   │   ├── bayesian_hmm.py               3-state HMM with soft posteriors (820 lines)
+│   │   │                                   Optimal state selection (2-5 states via BIC + CV), duration analysis
+│   │   ├── sac_agent.py                  SAC RL agent (train on Colab, infer on CPU) (608 lines)
+│   │   │                                   RunningMeanStd obs norm, curriculum learning, top-K ensemble
+│   │   ├── ensemble.py                   Meta-model: Kelly + multi-method + CVaR (525 lines)
+│   │   │                                   Adaptive BL views, dynamic Kelly, regime smoothing
+│   │   ├── portfolio_optimizer.py        8 methods: HRP, RP, BL, MVO, InvVol, MaxDiv, (512 lines)
+│   │   │                                   MinVar, CVaR — all with convergence monitoring
+│   │   ├── risk_analyzer.py              VaR/CVaR (4 methods inc. Cornish-Fisher), CDaR (545 lines)
+│   │   │                                   Tail dependence, rolling attribution, stress testing
+│   │   ├── correlation_analyzer.py       EWMA/DCC correlation, Marchenko-Pastur edge, (478 lines)
+│   │   │                                   MST, absorption ratio, hysteresis regime detection
+│   │   └── kalman_tracker.py             Kalman pair tracking (stETH/ETH, rETH/ETH) (426 lines)
+│   │                                       Depeg detection, multi-pair analysis
 │   ├── analysis/
-│   │   ├── portfolio_analysis.py         Post-hoc portfolio analytics and reporting
-│   │   └── universe_screening.py         CoinGecko market cap screening for asset selection
+│   │   ├── portfolio_analysis.py         Post-hoc portfolio analytics and reporting (1,322 lines)
+│   │   ├── universe_screening.py         1000-asset universe screening with adaptive (1,829 lines)
+│   │   │                                   10-50 selection, CoinGecko/Binance data, DeFi classification
+│   │   └── spillover_analysis.py         Diebold-Yilmaz (2012) spillover index (552 lines)
+│   │                                       VAR-based GFEVD, directional spillovers, contagion channels
 │   ├── environment/
-│   │   └── portfolio_env.py              Custom Gymnasium env (48-dim state, composite reward)
+│   │   └── portfolio_env.py              Custom Gymnasium env (48-dim state, composite reward) (543 lines)
+│   │                                       Square-root market impact, slippage, curriculum learning
 │   ├── backtest/
-│   │   ├── walk_forward.py               Walk-forward engine + 9 auto-generated charts
-│   │   ├── monte_carlo.py                10K-path regime-conditioned block bootstrap
-│   │   ├── benchmarks.py                 6 comparison strategies
-│   │   ├── metrics.py                    18+ metrics (Sharpe, Omega, Ulcer, CVaR, Burke, ...)
-│   │   ├── transaction_costs.py          Venue-specific costs (verified Q1 2026)
-│   │   └── crisis_events.py              12 crypto crises with stratified analysis
+│   │   ├── walk_forward.py               Walk-forward engine + 9 auto-generated charts (832 lines)
+│   │   │                                   Bootstrap CIs, significance tests vs benchmarks
+│   │   ├── monte_carlo.py                10K-path regime-conditioned block bootstrap (391 lines)
+│   │   │                                   t-copula comparison, fan charts, terminal distributions
+│   │   ├── benchmarks.py                 6 comparison strategies (313 lines)
+│   │   ├── metrics.py                    21+ metrics (Sharpe, Omega, Ulcer, Burke, ...) (443 lines)
+│   │   │                                   Bootstrap CIs, paired significance tests
+│   │   ├── transaction_costs.py          Venue-specific costs (verified Q1 2026) (255 lines)
+│   │   │                                   Almgren-Chriss impact, gas verified vs Etherscan
+│   │   ├── crisis_events.py              12 crypto crises with stratified analysis (277 lines)
+│   │   └── attribution.py               Brinson-Fachler performance attribution (706 lines)
+│   │                                       Regime, asset-class, model, risk management decomposition
 │   ├── weight_publisher/
-│   │   ├── compute_weights.py            Full pipeline: data → models → Merkle root
-│   │   ├── merkle.py                     Keccak-256 commitment tree
-│   │   └── publish.py                    Web3.py keeper: commit → timelock → execute
+│   │   ├── compute_weights.py            Full pipeline: data → models → Merkle root (298 lines)
+│   │   ├── merkle.py                     Keccak-256 commitment tree (248 lines)
+│   │   │                                   Multi-leaf proofs, sorted pair hashing (OZ-compatible)
+│   │   └── publish.py                    Web3.py keeper: commit → timelock → execute (316 lines)
+│   │                                       Gas estimation, retry logic, receipt logging
 │   └── notebooks/
 │       ├── train_sac.ipynb               Colab GPU training notebook
 │       ├── universe_screening.ipynb      Interactive universe screening analysis

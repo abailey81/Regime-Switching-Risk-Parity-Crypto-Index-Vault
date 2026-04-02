@@ -23,6 +23,12 @@ coverage/
 dashboard/dist/
 dashboard/node_modules/
 *.log
+# Sensitive / generated files
+*.key
+*.pem
+ml/data/cache/*.parquet
+ml/data/cache/*.json
+!ml/data/cache/.gitkeep
 # Internal planning & brief
 master_plan_v2.md
 Individual Coursework*.docx

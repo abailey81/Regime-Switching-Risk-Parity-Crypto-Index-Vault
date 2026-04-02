@@ -36,6 +36,29 @@ from scipy.cluster.hierarchy import linkage, fcluster, leaves_list
 from scipy.spatial.distance import squareform
 from scipy.optimize import minimize as sp_minimize
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    class tqdm:
+        """Minimal tqdm fallback that supports iteration and no-op methods."""
+        def __init__(self, iterable=None, *a, **kw):
+            self._iterable = iterable
+            self.total = kw.get("total", None)
+        def __iter__(self):
+            return iter(self._iterable if self._iterable is not None else [])
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+        def update(self, n=1):
+            pass
+        def set_postfix(self, **kw):
+            pass
+        def set_description(self, desc):
+            pass
+        def close(self):
+            pass
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -386,11 +409,6 @@ class UniverseScreener:
         dict
             symbol -> pd.DataFrame with OHLCV columns.
         """
-        try:
-            from tqdm import tqdm
-        except ImportError:
-            tqdm = None
-
         import ccxt
 
         _safe_log(f"Stage 2: Fetching daily OHLCV for {len(symbols)} assets "
@@ -480,11 +498,7 @@ class UniverseScreener:
         succeeded = 0
         failed = 0
 
-        iterator = symbols_to_fetch
-        if tqdm is not None:
-            iterator_display = tqdm(total=len(symbols_to_fetch), desc="Fetching OHLCV")
-        else:
-            iterator_display = None
+        fetch_bar = tqdm(total=len(symbols_to_fetch), desc="Fetching OHLCV", unit="asset", leave=True)
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(_fetch_single, sym): sym for sym in symbols_to_fetch}
@@ -501,11 +515,10 @@ class UniverseScreener:
                     logger.debug("Stage 2: Future failed for %s: %s", sym, e)
                     failed += 1
 
-                if iterator_display is not None:
-                    iterator_display.update(1)
+                fetch_bar.update(1)
+                fetch_bar.set_postfix(ok=succeeded, fail=failed, asset=sym[:8])
 
-        if iterator_display is not None:
-            iterator_display.close()
+        fetch_bar.close()
 
         self.ohlcv_data = data
         _safe_log(f"Stage 2: Fetched {succeeded} assets, {failed} failed, "
@@ -553,7 +566,9 @@ class UniverseScreener:
         # Track base symbols to detect wrapped duplicates
         base_volume_map: Dict[str, Tuple[str, float]] = {}
 
-        for sym, df in self.ohlcv_data.items():
+        liq_bar = tqdm(self.ohlcv_data.items(), desc="Liquidity Filter", unit="asset", leave=False, total=initial_count)
+        for sym, df in liq_bar:
+            liq_bar.set_postfix(sym=sym[:8], passed=len(survivors))
             # Skip stablecoins
             if sym.upper() in _STABLECOINS:
                 removed_reasons[sym] = "stablecoin"
@@ -613,7 +628,7 @@ class UniverseScreener:
                 survivors.append(sym)
 
         self.liquid_symbols = survivors
-        _safe_log(f"Stage 3: {initial_count} -> {len(survivors)} assets after liquidity filter")
+        _safe_log(f"Stage 3: Liquidity Filter | {initial_count} -> {len(survivors)} passed")
 
         if removed_reasons:
             reasons_summary = {}
@@ -654,7 +669,9 @@ class UniverseScreener:
         removed: Dict[str, str] = {}
         hurst_flags: Dict[str, float] = {}
 
-        for sym in self.liquid_symbols:
+        qual_bar = tqdm(self.liquid_symbols, desc="Quality Filter", unit="asset", leave=False)
+        for sym in qual_bar:
+            qual_bar.set_postfix(sym=sym[:8], passed=len(survivors))
             rets = self.returns_data.get(sym)
             if rets is None or len(rets) < 100:
                 removed[sym] = "insufficient_returns"
@@ -777,7 +794,9 @@ class UniverseScreener:
 
         profiles: List[dict] = []
 
-        for sym in self.quality_symbols:
+        profile_bar = tqdm(self.quality_symbols, desc="Profiling", unit="asset", leave=False)
+        for sym in profile_bar:
+            profile_bar.set_postfix(asset=sym[:8])
             rets = self.returns_data.get(sym)
             vol = self.volume_data.get(sym)
             if rets is None or len(rets) < 50:
@@ -1218,7 +1237,12 @@ class UniverseScreener:
             best_dr = -np.inf
             best_combo: Optional[Tuple[str, ...]] = None
 
-            for combo in combinations(pool, n_to_select):
+            combo_bar = tqdm(
+                combinations(pool, n_to_select),
+                desc="Selection | Exhaustive", unit="combo",
+                total=total_combos, leave=False,
+            )
+            for combo in combo_bar:
                 selection = forced + list(combo)
                 if not _check_cluster_constraint(selection):
                     continue
@@ -1226,6 +1250,7 @@ class UniverseScreener:
                 if dr > best_dr:
                     best_dr = dr
                     best_combo = combo
+                    combo_bar.set_postfix(best_DR=f"{best_dr:.3f}")
 
             if best_combo is not None:
                 selected = forced + list(best_combo)
@@ -1310,7 +1335,8 @@ class UniverseScreener:
         selected = list(forced)
         remaining = list(pool)
 
-        for step in range(n_to_select):
+        greedy_bar = tqdm(range(n_to_select), desc="Selection | Greedy", unit="asset", leave=False)
+        for step in greedy_bar:
             best_dr = -np.inf
             best_candidate = None
 
@@ -1347,7 +1373,9 @@ class UniverseScreener:
 
             selected.append(best_candidate)
             remaining.remove(best_candidate)
+            greedy_bar.set_postfix(added=best_candidate, DR=f"{best_dr:.3f}")
 
+        greedy_bar.close()
         return selected
 
     # ══════════════════════════════════════════════════════════════════════════

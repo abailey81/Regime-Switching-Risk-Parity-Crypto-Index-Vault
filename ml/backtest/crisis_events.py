@@ -2,7 +2,7 @@
 Crypto Crisis Event Definitions for Regime-Stratified Backtest Analysis.
 
 Adapted from Crypto-Statistical-Arbitrage/backtesting/analysis/crisis_analyzer.py.
-All 14 major crypto crisis events from 2020-2024, used for:
+All 12 major crypto crisis events from 2020-2024, used for:
   - Regime-stratified performance metrics (Sharpe during crisis vs bull)
   - Stress testing the ensemble's regime detection capability
   - HMM validation (did the model detect the crisis?)
@@ -60,7 +60,7 @@ class CrisisEvent:
         return (self.end_dt - self.start_dt).days
 
 
-# All 14 major crypto crises (from stat-arb walk_forward_optimizer.py)
+# All 12 major crypto crises (from stat-arb walk_forward_optimizer.py)
 CRYPTO_CRISES: List[CrisisEvent] = [
     CrisisEvent(
         name="COVID Crash",

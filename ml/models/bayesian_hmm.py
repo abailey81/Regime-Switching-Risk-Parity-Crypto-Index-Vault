@@ -23,6 +23,12 @@ import pandas as pd
 from hmmlearn import hmm
 from sklearn.preprocessing import StandardScaler
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable=None, *a, **kw):
+        return iterable if iterable is not None else range(0)
+
 logger = logging.getLogger(__name__)
 
 
@@ -137,7 +143,9 @@ class BayesianRegimeHMM:
         n_obs = X_scaled.shape[0]
         results = {}
 
-        for n_s in self.state_range:
+        state_bar = tqdm(self.state_range, desc="State selection", unit="n_states", leave=True)
+        for n_s in state_bar:
+            state_bar.set_postfix(n_states=n_s)
             try:
                 # Fit with multiple restarts
                 model, best_ll = self._fit_with_restarts(X_scaled, n_s)
@@ -157,6 +165,7 @@ class BayesianRegimeHMM:
                     "n_params": k,
                 }
 
+                state_bar.set_postfix(n_states=n_s, BIC=f"{bic:.1f}")
                 logger.info(
                     f"    n_states={n_s}: BIC={bic:.1f}, LL={best_ll:.1f}, CV_LL={cv_ll:.1f}"
                 )
@@ -231,7 +240,11 @@ class BayesianRegimeHMM:
             return -np.inf
 
         cv_scores = []
-        for fold in range(1, self.cv_folds + 1):
+        cv_bar = tqdm(range(1, self.cv_folds + 1),
+                       desc=f"CV folds | {n_states} states",
+                       unit="fold", leave=False)
+        for fold in cv_bar:
+            cv_bar.set_postfix(fold=f"{fold}/{self.cv_folds}")
             train_end = fold_size * (fold + 1)
             test_start = train_end
             test_end = min(test_start + fold_size, n_obs)
@@ -252,6 +265,8 @@ class BayesianRegimeHMM:
                 model.fit(X_train)
                 score = model.score(X_test)
                 cv_scores.append(score)
+                cv_bar.set_postfix(fold=f"{fold}/{self.cv_folds}",
+                                    mean_LL=f"{np.mean(cv_scores):.1f}")
             except Exception:
                 continue
 
@@ -275,8 +290,12 @@ class BayesianRegimeHMM:
         best_model = None
         best_ll = -np.inf
         convergence_scores = []
+        n_converged_count = 0
 
-        for i in range(self.n_init):
+        restart_bar = tqdm(range(self.n_init),
+                           desc=f"Random restarts | {n_states} states",
+                           unit="restart", leave=False)
+        for i in restart_bar:
             try:
                 model = hmm.GaussianHMM(
                     n_components=n_states,
@@ -296,6 +315,7 @@ class BayesianRegimeHMM:
                 model.fit(X_scaled)
                 ll = model.score(X_scaled)
                 convergence_scores.append(ll)
+                n_converged_count += 1
 
                 if ll > best_ll:
                     best_ll = ll
@@ -303,6 +323,8 @@ class BayesianRegimeHMM:
             except Exception:
                 convergence_scores.append(-np.inf)
                 continue
+            restart_bar.set_postfix(converged=f"{n_converged_count}/{i + 1}",
+                                    best_LL=f"{best_ll:.1f}")
 
         self.convergence_history = convergence_scores
 

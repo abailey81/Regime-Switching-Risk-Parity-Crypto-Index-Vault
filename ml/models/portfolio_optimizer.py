@@ -31,6 +31,12 @@ from scipy.optimize import minimize as sp_minimize
 from scipy.stats import norm
 from dataclasses import dataclass, field
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable=None, *a, **kw):
+        return iterable if iterable is not None else range(0)
+
 logger = logging.getLogger(__name__)
 
 
@@ -85,18 +91,24 @@ class MultiMethodOptimizer:
             w = w / w.sum()
 
             final_iter = 0
-            for i in range(200):
+            rp_bar = tqdm(range(200), desc="Risk Parity", unit="iter", leave=False)
+            for i in rp_bar:
                 port_vol = np.sqrt(w @ cov @ w)
                 if port_vol < 1e-12:
                     break
                 marginal = cov @ w
                 risk_contrib = w * marginal / port_vol
                 target = port_vol / n
+                deviation = float(np.max(np.abs(risk_contrib - target)))
                 adjustment = np.clip(target / (risk_contrib + 1e-12), 0.5, 2.0)
                 w = w * adjustment
                 w = np.maximum(w, 1e-6)
                 w = w / w.sum()
                 final_iter = i + 1
+                rp_bar.set_postfix(dev=f"{deviation:.6f}")
+                if deviation < 1e-8:
+                    break
+            rp_bar.close()
 
             # Convergence monitoring
             port_vol = np.sqrt(w @ cov @ w)
@@ -284,7 +296,8 @@ class MultiMethodOptimizer:
             vols = np.sqrt(np.maximum(np.diag(cov), 1e-12))
             w = np.ones(n) / n
 
-            for iteration in range(300):
+            md_bar = tqdm(range(300), desc="Max Diversification", unit="iter", leave=False)
+            for iteration in md_bar:
                 port_vol = np.sqrt(w @ cov @ w)
                 if port_vol < 1e-12:
                     break
@@ -292,6 +305,9 @@ class MultiMethodOptimizer:
                 w = w + 0.005 * gradient
                 w = np.maximum(w, 1e-6)
                 w = w / w.sum()
+                current_div = (vols @ w) / np.sqrt(w @ cov @ w) if np.sqrt(w @ cov @ w) > 0 else 1.0
+                md_bar.set_postfix(div_ratio=f"{current_div:.4f}")
+            md_bar.close()
 
             # Convergence monitoring: log diversification ratio
             port_vol = np.sqrt(w @ cov @ w)
@@ -424,7 +440,10 @@ class MultiMethodOptimizer:
             methods["mean_variance"] = lambda: self.mean_variance(mu, cov)
 
         results = []
-        for name, func in methods.items():
+        method_bar = tqdm(methods.items(), desc="Comparing methods",
+                          unit="method", total=len(methods), leave=True)
+        for name, func in method_bar:
+            method_bar.set_postfix(method=name)
             try:
                 w = func()
                 port_vol = float(np.sqrt(w @ cov @ w) * np.sqrt(8760))
@@ -451,6 +470,8 @@ class MultiMethodOptimizer:
                     "max_weight": float(w.max()),
                     "min_weight": float(w.min()),
                 })
+                method_bar.set_postfix(method=name, vol=f"{port_vol:.2%}",
+                                        Sharpe=f"{div_ratio:.2f}")
             except Exception as e:
                 logger.warning("  %s failed in comparison: %s", name, e)
 

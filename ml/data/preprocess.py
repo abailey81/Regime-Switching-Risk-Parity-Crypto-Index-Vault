@@ -24,6 +24,29 @@ import pandas as pd
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    class tqdm:
+        """Minimal tqdm fallback that supports iteration and no-op methods."""
+        def __init__(self, iterable=None, *a, **kw):
+            self._iterable = iterable
+            self.total = kw.get("total", None)
+        def __iter__(self):
+            return iter(self._iterable if self._iterable is not None else [])
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+        def update(self, n=1):
+            pass
+        def set_postfix(self, **kw):
+            pass
+        def set_description(self, desc):
+            pass
+        def close(self):
+            pass
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -163,7 +186,8 @@ def test_stationarity(
     from statsmodels.tsa.stattools import adfuller
 
     results = {}
-    for col in returns_df.columns:
+    adf_bar = tqdm(returns_df.columns, desc="ADF Test", unit="asset", leave=False)
+    for col in adf_bar:
         series = returns_df[col].dropna()
         if len(series) < 30:
             logger.warning(f"  ADF skip {col}: too few observations ({len(series)})")
@@ -184,6 +208,8 @@ def test_stationarity(
                 "is_stationary": bool(is_stat),
                 "lags_used": int(lags),
             }
+            status_mark = "ok" if is_stat else "FAIL"
+            adf_bar.set_postfix(asset=col, p=f"{pval:.3f}", status=status_mark)
             if not is_stat:
                 logger.warning(
                     f"  ADF: {col} is NON-STATIONARY (p={pval:.4f}). "
@@ -337,7 +363,9 @@ def compute_features(
     if "BTC" in prices_df.columns:
         btc_returns = np.log(prices_df["BTC"] / prices_df["BTC"].shift(1))
 
-    for col in prices_df.columns:
+    feat_bar = tqdm(prices_df.columns, desc="Features", unit="asset", leave=False)
+    for col in feat_bar:
+        feat_bar.set_postfix(asset=col)
         p = prices_df[col]
         lr = np.log(p / p.shift(1))
 
@@ -468,7 +496,7 @@ def compute_cross_asset_features(
 
     # Efficient rolling average correlation
     corr_values = []
-    for i in range(len(returns_df)):
+    for i in tqdm(range(len(returns_df)), desc="Cross-asset | Avg corr", unit="step", leave=False):
         if i < corr_window:
             corr_values.append(np.nan)
         else:
@@ -483,7 +511,7 @@ def compute_cross_asset_features(
     from sklearn.decomposition import PCA
 
     pc_ratios = []
-    for i in range(len(returns_df)):
+    for i in tqdm(range(len(returns_df)), desc="Cross-asset | PCA", unit="step", leave=False):
         if i < corr_window:
             pc_ratios.append(np.nan)
         else:
@@ -550,7 +578,7 @@ def normalize_features(
         logger.info(f"Applied rolling z-score normalization (window={window})")
 
     elif method == "rank":
-        for col_tuple in features_df.columns:
+        for col_tuple in tqdm(features_df.columns, desc="Rank normalization", unit="col", leave=False):
             col_data = features_df[col_tuple]
             normalized[col_tuple] = col_data.rolling(window, min_periods=30).apply(
                 lambda x: pd.Series(x).rank(pct=True).iloc[-1], raw=False
