@@ -52,7 +52,7 @@
 | **Vault Address** | `0x_TO_BE_UPDATED_AFTER_DEPLOYMENT` |
 | **Share Token** | rpCRYPTO (ERC-20 via ERC-4626) |
 | **Underlying** | USDC |
-| **Total Code** | 5,787 lines across 18 Python + 4 Solidity + 4 JS files |
+| **Total Code** | 12,381 lines across 18 Python + 4 Solidity + 4 JS files |
 
 ---
 
@@ -199,7 +199,7 @@ Combines all three model outputs through a multi-stage pipeline:
 
 ## Multi-Method Optimiser
 
-The ensemble selects from **7 optimisation methods** per regime:
+The ensemble selects from **8 optimisation methods** per regime:
 
 | Method | Best For | Source |
 |:---|:---|:---|
@@ -209,13 +209,14 @@ The ensemble selects from **7 optimisation methods** per regime:
 | **Mean-Variance** (Max Sharpe) | Low-vol — when estimates are reliable | Markowitz (1952) |
 | **Inverse Volatility** | Baseline — simple, robust | — |
 | **Max Diversification** | High-corr — maximises diversification ratio | Choueifaty (2008) |
+| **Minimum Variance** | Risk-averse — global minimum portfolio variance | Markowitz (1952) |
 | **CVaR-Constrained** | Always — enforces hard risk limits | Rockafellar & Uryasev (2000) |
 
 ---
 
 ## Smart Contract
 
-**`contracts/RiskParityVault.sol`** — 835 lines of Solidity 0.8.24
+**`contracts/RiskParityVault.sol`** — 1,294 lines of Solidity 0.8.24 (fully NatSpec documented)
 
 <table>
 <tr>
@@ -388,13 +389,13 @@ VS Code
 | Test window | 30 days (720 hours) |
 | Step size | 30 days (rolling) |
 | Transaction costs | Venue-specific (verified Q1 2026) |
-| Benchmarks | Equal Weight, BTC Only, 60/40 BTC/USDC, Market-Cap Weighted |
+| Benchmarks | Equal Weight, BTC Only, 60/40 BTC/USDC, Market-Cap, Risk Parity Static, Min Variance |
 
 ### Generated Outputs (9 Charts + Metrics)
 
 | Chart | Description |
 |:---|:---|
-| `equity_curves.png` | Log-scale performance: ensemble vs 4 benchmarks |
+| `equity_curves.png` | Log-scale performance: ensemble vs 6 benchmarks |
 | `drawdown_plot.png` | Drawdown comparison over time |
 | `regime_timeline.png` | HMM regime classification (colour-coded bull/normal/crisis) |
 | `weight_evolution.png` | Stacked area chart of portfolio weights over time |
