@@ -115,6 +115,17 @@
 
 ---
 
+## Asset → Token → Market → Risk Logic Chain
+
+| Layer | Design | Rationale |
+|:---|:---|:---|
+| **Asset** | 8-asset crypto portfolio across 4 classes (spot, staking, treasuries, stablecoin) | Four distinct value sources: capital appreciation, staking yield (~3–4%), Treasury coupon (~4.5–5%), defensive stability. Imperfectly correlated → portfolio risk < individual asset risk |
+| **Token** | ERC-4626 vault share (rpCRYPTO) — fungible, variable supply, pro-rata NAV claim | Fungible because each share represents identical fractional NAV. ERC-4626 standard ensures composability with Aave, Yearn, and other DeFi protocols |
+| **Market** | Three-layer liquidity: (1) primary mint/redeem at NAV, (2) secondary AMM (Uniswap V3), (3) keeper arbitrage | Primary for institutional entry/exit. Secondary for retail trading. Arbitrage keeps secondary price within ~1% of NAV |
+| **Risk** | Model risk (ensemble hedging), oracle risk (Chainlink + staleness), contract risk (reentrancy guard, pause), market risk (circuit breaker, redemption gate) | Each risk layer has a specific mitigation mechanism embedded in the smart contract or ML pipeline |
+
+---
+
 ## Portfolio Constituents
 
 | Asset Class | Asset | Ticker | Value Source | Rebalance Venue | Fee (bps) |
@@ -216,7 +227,7 @@ The ensemble selects from **8 optimisation methods** per regime:
 
 ## Smart Contract
 
-**`contracts/RiskParityVault.sol`** — 1,294 lines of Solidity 0.8.24 (fully NatSpec documented)
+**`contracts/RiskParityVault.sol`** — 1,294 lines of Solidity 0.8.24 (NatSpec documented)
 
 <table>
 <tr>
@@ -297,6 +308,18 @@ Redemption Fee (0.3% within 7 days)
                    │
                    ▼
 ```
+
+---
+
+## Financial Design Highlights
+
+| Design Choice | Financial Rationale |
+|:---|:---|
+| **3-Tier Fee Structure** | Management fee (1%) compensates ongoing operation costs. Performance fee (10% above HWM) aligns manager incentives — fees only charged on NEW gains. Redemption fee (0.3% within 7 days) discourages short-term arbitrage that extracts value from long-term holders |
+| **Merkle Commit-Reveal** | Prevents keeper from front-running rebalance trades. Without this, keeper could buy assets about to be weighted up, then execute weights for risk-free profit. 1-hour timelock makes this uneconomical |
+| **Circuit Breaker (15% DD)** | Calibrated from 12 historical crypto crises (2020–2024) where average BTC drawdown was -33%. Triggers at 15% to catch drawdowns early, shifting 90% to USDC/Treasuries before the worst losses materialise |
+| **20% Redemption Gate** | Prevents liquidity spirals: if 100% of investors try to exit simultaneously, the gate ensures orderly processing over 5 days. Modelled on traditional fund gates (e.g., Woodford Capital, 2019) |
+| **Inverse-Variance Ensemble** | When one model (e.g., GARCH) has high parameter uncertainty, its weight automatically decreases. This is formally equivalent to a Bayesian model averaging approach |
 
 ---
 
@@ -497,23 +520,23 @@ The backtest evaluates performance across **12 major crypto crises** (2020–202
 ```
 Regime-Switching-Risk-Parity-Crypto-Index-Vault/
 │
-├── contracts/                          Solidity (1,026 lines)
-│   ├── RiskParityVault.sol               Core ERC-4626 vault (835 lines)
+├── contracts/                          Solidity (1,641 lines)
+│   ├── RiskParityVault.sol               Core ERC-4626 vault (1,294 lines)
 │   ├── mocks/
 │   │   ├── MockERC20.sol                 Mintable test tokens with faucet
 │   │   └── MockPriceFeed.sol             Simulated Chainlink (TWAP + history)
 │   └── interfaces/
 │       └── IChainlinkAggregator.sol      Oracle interface
 │
-├── scripts/                            Deployment & interaction (605 lines)
+├── scripts/                            Deployment & interaction (387 lines)
 │   ├── deploy_mocks.js                   Deploy 8 test tokens + 8 price feeds
 │   ├── deploy.js                         Deploy vault, register constituents
 │   └── interact.js                       Full lifecycle: deposit → rebalance → withdraw
 │
 ├── test/
-│   └── RiskParityVault.test.js           30+ tests (fees, epochs, circuit breaker, Merkle)
+│   └── RiskParityVault.test.js           30+ tests, 809 lines (fees, epochs, circuit breaker, Merkle)
 │
-├── ml/                                 Python ML pipeline (4,156 lines)
+├── ml/                                 Python ML pipeline (9,532 lines)
 │   ├── config.yaml                       ALL hyperparameters (single source of truth)
 │   ├── data/
 │   │   ├── fetch_data.py                 Binance OHLCV + synthetic Treasury/stablecoin
@@ -557,7 +580,15 @@ Regime-Switching-Risk-Parity-Crypto-Index-Vault/
 
 ## Related Work
 
-This vault adapts portfolio construction and risk management components from the author's **[Crypto-Statistical-Arbitrage](https://github.com/abailey81/Crypto-Statistical-Arbitrage)** system — a multi-venue quantitative trading platform achieving Sharpe 1.61 (altcoin) / 5.81 (BTC futures) on walk-forward out-of-sample tests. Specific adaptations include the HRP optimiser, risk decomposition framework, crisis event definitions, and venue-specific transaction cost models.
+This vault adapts portfolio construction and risk management components from the author's **[Crypto-Statistical-Arbitrage](https://github.com/abailey81/Crypto-Statistical-Arbitrage)** system — a multi-venue quantitative trading platform achieving Sharpe 1.61 (altcoin) / 5.81 (BTC futures) on walk-forward out-of-sample tests.
+
+**Components adapted from prior work:**
+- HRP, Risk Parity, Black-Litterman optimisers
+- VaR/CVaR risk decomposition framework
+- Almgren-Chriss transaction cost model
+- Crisis event definitions
+
+**All other components are original to this project:** ERC-4626 vault design, ensemble orchestration, HMM regime detection, SAC RL environment, Merkle commit-reveal, circuit breaker.
 
 ---
 
@@ -582,11 +613,11 @@ MIT — see [LICENSE](LICENSE)
 
 ---
 
+*This project was developed as the individual coursework (60%) for IFTE0007 — Decentralised Finance & Blockchain, UCL Institute of Finance & Technology, MSc Digital Finance & Banking, 2025/26.*
+
 <div align="center">
 
 <br />
-
-*IFTE0007 Individual Coursework (60%) — UCL Institute of Finance & Technology, 2025/26*
 
 Built by [**Tamer Atesyakar**](https://github.com/abailey81)
 
