@@ -1078,7 +1078,7 @@ class UniverseScreener:
 
                 _cg_ok = 0
                 _consecutive_fails = 0
-                _GIVE_UP = 30
+                _GIVE_UP = 15  # Stop faster — if 15 in a row fail, remaining are all junk
 
                 cg_bar = tqdm(_real_missing, desc="[CG] CoinGecko", unit="coin", leave=True)
                 for sym in cg_bar:
@@ -1095,7 +1095,8 @@ class UniverseScreener:
                                      params={"vs_currency": "usd", "days": str(min(lookback_days, 365))},
                                      headers=_cg_headers, timeout=15)
                         if r.status_code == 429:
-                            _time.sleep(30)
+                            _consecutive_fails += 1
+                            _time.sleep(5)  # Short wait, count as failure
                             continue
                         if r.status_code != 200:
                             _consecutive_fails += 1
