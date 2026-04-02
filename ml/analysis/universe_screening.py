@@ -699,6 +699,7 @@ class UniverseScreener:
             symbol -> pd.DataFrame with OHLCV columns.
         """
         import ccxt
+        import requests as _requests
 
         _safe_log(f"Stage 2: Fetching daily OHLCV for {len(symbols)} assets "
                    f"({lookback_days}d lookback)...")
@@ -721,7 +722,7 @@ class UniverseScreener:
                 if datetime.now() - mtime < timedelta(hours=24):
                     try:
                         df = pd.read_parquet(cache_file)
-                        if len(df) >= lookback_days * 0.5:  # at least 50% coverage
+                        if len(df) >= lookback_days * 0.5:
                             data[sym] = df
                             continue
                     except Exception:
@@ -736,6 +737,123 @@ class UniverseScreener:
         if not symbols_to_fetch:
             self.ohlcv_data = data
             return data
+
+        # ══════════════════════════════════════════════════════════════
+        # PRIMARY SOURCE: CoinGecko (guaranteed data for listed coins)
+        # ══════════════════════════════════════════════════════════════
+        #
+        # CoinGecko's /coins/{id}/ohlc endpoint returns OHLC data for
+        # any listed coin. Unlike exchange APIs, this ALWAYS has data
+        # if the coin exists on CoinGecko.
+        #
+        # Strategy: fetch CoinGecko coin list once → map symbols to IDs
+        # → fetch OHLC in parallel → fall back to ccxt for any misses
+
+        _CG_BASE = "https://api.coingecko.com/api/v3"
+        _cg_api_key = None
+        _dotenv_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))), ".env")
+        if os.path.exists(_dotenv_path):
+            with open(_dotenv_path) as _ef:
+                for _line in _ef:
+                    if _line.strip().startswith("COINGECKO_API_KEY="):
+                        _cg_api_key = _line.strip().split("=", 1)[1]
+                        break
+
+        _cg_headers = {}
+        if _cg_api_key:
+            _cg_headers["x-cg-demo-api-key"] = _cg_api_key
+            _safe_log("Stage 2: CoinGecko API key found (higher rate limits)")
+
+        # Build symbol → CoinGecko ID mapping
+        _safe_log("Stage 2: Building CoinGecko symbol map...")
+        _sym_to_cg_id: Dict[str, str] = {}
+        try:
+            resp = _requests.get(f"{_CG_BASE}/coins/list", headers=_cg_headers, timeout=30)
+            if resp.status_code == 200:
+                for coin in resp.json():
+                    sym_upper = coin.get("symbol", "").upper()
+                    cg_id = coin.get("id", "")
+                    # Prefer the most well-known ID per symbol
+                    if sym_upper not in _sym_to_cg_id or len(cg_id) < len(_sym_to_cg_id[sym_upper]):
+                        _sym_to_cg_id[sym_upper] = cg_id
+                _safe_log(f"Stage 2: CoinGecko map: {len(_sym_to_cg_id)} symbols")
+            else:
+                _safe_log(f"Stage 2: CoinGecko coin list failed ({resp.status_code})", "warning")
+        except Exception as e:
+            _safe_log(f"Stage 2: CoinGecko coin list error: {e}", "warning")
+
+        _cg_rate_limiter = _ExchangeRateLimiter("coingecko", max_rps=10.0 if _cg_api_key else 5.0, burst=3)
+        _cg_retry = _RetryWithCircuitBreaker(max_retries=2, cb_threshold=20, cb_cooldown=60)
+
+        def _fetch_from_coingecko(sym: str) -> Optional[pd.DataFrame]:
+            """Fetch daily OHLC from CoinGecko for a single symbol."""
+            cg_id = _sym_to_cg_id.get(sym.upper())
+            if not cg_id:
+                return None
+
+            _cg_rate_limiter.acquire()
+
+            def _do_fetch():
+                url = f"{_CG_BASE}/coins/{cg_id}/ohlc"
+                params = {"vs_currency": "usd", "days": str(lookback_days)}
+                r = _requests.get(url, params=params, headers=_cg_headers, timeout=30)
+                if r.status_code == 429:
+                    raise Exception("429 rate limit")
+                r.raise_for_status()
+                return r.json()
+
+            raw = _cg_retry.execute(_do_fetch, exchange_name="coingecko", rate_limiter=_cg_rate_limiter)
+            if raw is None or not isinstance(raw, list) or len(raw) < 30:
+                return None
+
+            df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+            df = df.set_index("timestamp").sort_index()
+            df = df[~df.index.duplicated(keep="first")]
+            df["volume"] = 0.0  # CoinGecko OHLC doesn't include volume
+            df["volume_usd"] = 0.0
+            return df
+
+        # Phase 1: Fetch from CoinGecko (guaranteed source) in parallel
+        _safe_log(f"Stage 2: Phase 1 — CoinGecko OHLC for {len(symbols_to_fetch)} assets...")
+        _cg_succeeded = 0
+        _cg_failed_syms: List[str] = []
+
+        cg_bar = tqdm(total=len(symbols_to_fetch), desc="CoinGecko OHLC", unit="asset", leave=True)
+
+        with ThreadPoolExecutor(max_workers=6) as cg_pool:
+            cg_futures = {cg_pool.submit(_fetch_from_coingecko, sym): sym for sym in symbols_to_fetch}
+            for fut in as_completed(cg_futures):
+                sym = cg_futures[fut]
+                try:
+                    df = fut.result()
+                    if df is not None and len(df) >= 30:
+                        # Cache
+                        cache_file = ohlcv_cache_dir / f"{sym}_daily.parquet"
+                        df.to_parquet(cache_file)
+                        data[sym] = df
+                        _cg_succeeded += 1
+                    else:
+                        _cg_failed_syms.append(sym)
+                except Exception:
+                    _cg_failed_syms.append(sym)
+                cg_bar.set_postfix(ok=_cg_succeeded, fail=len(_cg_failed_syms))
+                cg_bar.update(1)
+        cg_bar.close()
+
+        _safe_log(f"Stage 2: CoinGecko — {_cg_succeeded} succeeded, {len(_cg_failed_syms)} to try via exchanges")
+
+        # Update symbols_to_fetch to only include CoinGecko failures
+        symbols_to_fetch = _cg_failed_syms
+
+        if not symbols_to_fetch:
+            self.ohlcv_data = data
+            _safe_log(f"Stage 2: All {len(data)} assets fetched via CoinGecko")
+            return data
+
+        # Phase 2: Exchange fallback for CoinGecko failures
+        _safe_log(f"Stage 2: Phase 2 — Exchange fallback for {len(symbols_to_fetch)} remaining assets...")
 
         # Reuse authenticated exchanges from Stage 1, create pools for parallel fetching
         _connected = getattr(self, '_connected_exchanges', {})

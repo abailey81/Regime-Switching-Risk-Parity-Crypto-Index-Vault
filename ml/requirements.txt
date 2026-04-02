@@ -33,3 +33,4 @@ eth-abi==5.0.0
 pyyaml==6.0.1
 tqdm==4.66.2
 python-dotenv==1.0.1
+requests==2.31.0
