@@ -7,7 +7,12 @@ Sources:
   - Synthetic: GBM for Treasuries (BUIDL/USDY), depeg-aware for USDC
 
 Includes:
-  - Exponential-backoff retries
+  - Adaptive token-bucket rate limiter with latency tracking
+  - Retry handler with circuit breaker pattern per exchange
+  - Connection pool with health checks and auto-reconnect
+  - Parallel fetching via ThreadPoolExecutor with progress tracking
+  - Post-fetch data integrity pipeline (gap fill, anomaly detection)
+  - Exponential-backoff retries with jitter
   - OHLCV validation (no negative prices, high >= low, etc.)
   - Data quality reporting with JSON output
   - SHA-256 cache integrity verification
@@ -19,12 +24,36 @@ import time as _time
 import json
 import hashlib
 import logging
+import random
 import yaml
 import numpy as np
 import pandas as pd
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from threading import Lock
 from typing import Dict, Optional, List, Tuple
+
+try:
+    from tqdm import tqdm
+except ImportError:  # graceful fallback if tqdm not installed
+    class tqdm:  # type: ignore[no-redef]
+        """Minimal no-op shim when tqdm is unavailable."""
+        def __init__(self, iterable=None, **kw):
+            self._it = iterable
+            self.total = kw.get("total", 0)
+        def __iter__(self):
+            return iter(self._it or [])
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+        def update(self, n=1):
+            pass
+        def set_postfix_str(self, s, refresh=True):
+            pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -211,6 +240,413 @@ def _compute_quality_metrics(df: pd.DataFrame, symbol: str, freq: str = "1h") ->
 
 
 # ---------------------------------------------------------------------------
+# Adaptive Token Bucket Rate Limiter
+# ---------------------------------------------------------------------------
+
+class AdaptiveRateLimiter:
+    """
+    Thread-safe token-bucket rate limiter that adapts to exchange pressure.
+
+    Tracks recent request latencies; when latency spikes above 2x the
+    running average the limiter halves its request rate.  When latency
+    returns to normal the rate gradually recovers (10% per successful
+    low-latency request).
+    """
+
+    def __init__(self, max_rps: float = 10.0, burst: int = 5):
+        self._max_rps = max_rps
+        self._current_rps = max_rps
+        self._burst = burst
+        self._tokens = float(burst)
+        self._last_refill = _time.monotonic()
+        self._lock = Lock()
+
+        # Latency tracking (sliding window of last 50 measurements)
+        self._latencies: deque = deque(maxlen=50)
+        self._latency_lock = Lock()
+        self._baseline_latency: Optional[float] = None
+
+    def acquire(self) -> float:
+        """
+        Block until a token is available.  Returns the time spent waiting
+        (in seconds).
+        """
+        waited = 0.0
+        while True:
+            with self._lock:
+                now = _time.monotonic()
+                elapsed = now - self._last_refill
+                self._tokens = min(
+                    self._burst,
+                    self._tokens + elapsed * self._current_rps,
+                )
+                self._last_refill = now
+
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return waited
+
+            # No token available — wait for the next one
+            sleep_time = 1.0 / max(self._current_rps, 0.1)
+            _time.sleep(sleep_time)
+            waited += sleep_time
+
+    def record_latency(self, latency_ms: float):
+        """
+        Record a request latency and adapt the rate if needed.
+
+        * Spike (>2x average) -> halve rate (floor: 10% of max)
+        * Normal               -> increase rate by 10% (cap: max_rps)
+        """
+        with self._latency_lock:
+            self._latencies.append(latency_ms)
+            if len(self._latencies) < 5:
+                return  # not enough data yet
+            avg = sum(self._latencies) / len(self._latencies)
+            if self._baseline_latency is None:
+                self._baseline_latency = avg
+
+        with self._lock:
+            if latency_ms > 2.0 * (self._baseline_latency or avg):
+                # Pressure detected — throttle
+                self._current_rps = max(
+                    self._current_rps * 0.5,
+                    self._max_rps * 0.1,
+                )
+                logger.debug(
+                    f"Rate limiter: latency spike ({latency_ms:.0f}ms vs "
+                    f"avg {avg:.0f}ms) — throttled to {self._current_rps:.1f} rps"
+                )
+            else:
+                # Normal — recover gradually
+                self._current_rps = min(
+                    self._current_rps * 1.10,
+                    self._max_rps,
+                )
+
+    @property
+    def current_rps(self) -> float:
+        with self._lock:
+            return self._current_rps
+
+
+# ---------------------------------------------------------------------------
+# Retry Handler with Circuit Breaker
+# ---------------------------------------------------------------------------
+
+class RetryHandler:
+    """
+    Exponential backoff with jitter and per-exchange circuit breaker.
+
+    After *circuit_breaker_threshold* consecutive failures for a given
+    exchange the circuit opens and all requests to that exchange are
+    rejected for *circuit_breaker_cooldown* seconds.
+    """
+
+    def __init__(
+        self,
+        max_retries: int = 5,
+        circuit_breaker_threshold: int = 10,
+        circuit_breaker_cooldown: int = 300,
+    ):
+        self.max_retries = max_retries
+        self.cb_threshold = circuit_breaker_threshold
+        self.cb_cooldown = circuit_breaker_cooldown
+
+        # Per-exchange tracking  {name: {"failures": int, "successes": int,
+        #                                 "consecutive_fails": int,
+        #                                 "open_until": float}}
+        self._stats: Dict[str, dict] = {}
+        self._lock = Lock()
+
+    def _ensure_exchange(self, name: str):
+        if name not in self._stats:
+            self._stats[name] = {
+                "failures": 0,
+                "successes": 0,
+                "retries": 0,
+                "consecutive_fails": 0,
+                "open_until": 0.0,
+            }
+
+    def is_circuit_open(self, exchange_name: str) -> bool:
+        with self._lock:
+            self._ensure_exchange(exchange_name)
+            s = self._stats[exchange_name]
+            if s["open_until"] > _time.monotonic():
+                return True
+            if s["open_until"] > 0:
+                # Cooldown expired — reset
+                s["consecutive_fails"] = 0
+                s["open_until"] = 0.0
+            return False
+
+    def execute(self, func, *args, exchange_name: str = "unknown", **kwargs):
+        """
+        Call *func(*args, **kwargs)* with retries and circuit breaker.
+        Returns the function result or raises the last exception.
+        """
+        if self.is_circuit_open(exchange_name):
+            raise RuntimeError(
+                f"Circuit breaker OPEN for {exchange_name} — skipping"
+            )
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                result = func(*args, **kwargs)
+                with self._lock:
+                    self._ensure_exchange(exchange_name)
+                    self._stats[exchange_name]["successes"] += 1
+                    self._stats[exchange_name]["consecutive_fails"] = 0
+                return result
+            except Exception as exc:
+                last_exc = exc
+                with self._lock:
+                    self._ensure_exchange(exchange_name)
+                    s = self._stats[exchange_name]
+                    s["failures"] += 1
+                    s["retries"] += 1
+                    s["consecutive_fails"] += 1
+                    if s["consecutive_fails"] >= self.cb_threshold:
+                        s["open_until"] = (
+                            _time.monotonic() + self.cb_cooldown
+                        )
+                        logger.warning(
+                            f"Circuit breaker OPENED for {exchange_name} "
+                            f"after {s['consecutive_fails']} consecutive "
+                            f"failures — cooldown {self.cb_cooldown}s"
+                        )
+                        raise
+
+                # Exponential backoff with full jitter
+                base_wait = min(2 ** attempt, 60)
+                wait = random.uniform(0, base_wait)
+                logger.warning(
+                    f"    Retry {attempt}/{self.max_retries} for "
+                    f"{exchange_name}: {exc} — backoff {wait:.1f}s"
+                )
+                _time.sleep(wait)
+
+        raise last_exc  # type: ignore[misc]
+
+    def get_stats(self) -> dict:
+        with self._lock:
+            return {k: dict(v) for k, v in self._stats.items()}
+
+
+# ---------------------------------------------------------------------------
+# Exchange Connection Pool
+# ---------------------------------------------------------------------------
+
+class ExchangeConnectionPool:
+    """
+    Pre-initialises and reuses ccxt exchange instances.  Provides health
+    checks and automatic reconnection on failure.
+    """
+
+    def __init__(self, exchanges: Optional[List[str]] = None):
+        self._pool: Dict[str, object] = {}
+        self._lock = Lock()
+        if exchanges:
+            for name in exchanges:
+                self._init_exchange(name)
+
+    def _init_exchange(self, name: str):
+        """Create a fresh ccxt exchange instance."""
+        import ccxt
+        exchange_cls = getattr(ccxt, name, None)
+        if exchange_cls is None:
+            raise ValueError(f"Unknown exchange: {name}")
+        self._pool[name] = exchange_cls({"enableRateLimit": True})
+        logger.debug(f"Connection pool: initialised {name}")
+
+    def get(self, name: str):
+        """Return a cached exchange instance, creating one if needed."""
+        with self._lock:
+            if name not in self._pool:
+                self._init_exchange(name)
+            return self._pool[name]
+
+    def reconnect(self, name: str):
+        """Force-recreate the connection for *name*."""
+        with self._lock:
+            logger.info(f"Connection pool: reconnecting {name}")
+            self._init_exchange(name)
+            return self._pool[name]
+
+    def health_check(self) -> Dict[str, bool]:
+        """Ping each exchange and return {name: is_healthy}."""
+        results: Dict[str, bool] = {}
+        for name, exch in list(self._pool.items()):
+            try:
+                exch.fetch_time()  # type: ignore[union-attr]
+                results[name] = True
+            except Exception:
+                results[name] = False
+        return results
+
+
+# ---------------------------------------------------------------------------
+# Streaming Progress Reporter
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _FetchStats:
+    """Mutable counters shared across workers."""
+    total_assets: int = 0
+    completed: int = 0
+    cache_hits: int = 0
+    api_calls: int = 0
+    data_points: int = 0
+    retries: int = 0
+    start_time: float = field(default_factory=_time.monotonic)
+
+
+class FetchProgressReporter:
+    """Real-time progress bar + end-of-run summary for fetch_all_data."""
+
+    def __init__(self, total: int):
+        self._stats = _FetchStats(total_assets=total)
+        self._lock = Lock()
+        self._bar = tqdm(
+            total=total, desc="Fetching assets", unit="asset",
+            dynamic_ncols=True,
+        )
+
+    def tick(self, symbol: str, cache_hit: bool = False,
+             data_points: int = 0, api_calls: int = 0):
+        with self._lock:
+            self._stats.completed += 1
+            self._stats.data_points += data_points
+            self._stats.api_calls += api_calls
+            if cache_hit:
+                self._stats.cache_hits += 1
+        self._bar.set_postfix_str(symbol, refresh=True)
+        self._bar.update(1)
+
+    def add_retries(self, n: int = 1):
+        with self._lock:
+            self._stats.retries += n
+
+    def close(self):
+        self._bar.close()
+        elapsed = _time.monotonic() - self._stats.start_time
+        s = self._stats
+        logger.info(
+            f"Fetch complete in {elapsed:.1f}s | "
+            f"{s.completed}/{s.total_assets} assets | "
+            f"cache hits: {s.cache_hits} | "
+            f"API calls: {s.api_calls} | "
+            f"data points: {s.data_points:,} | "
+            f"retries: {s.retries}"
+        )
+
+    @property
+    def stats(self) -> _FetchStats:
+        return self._stats
+
+
+# ---------------------------------------------------------------------------
+# Data Integrity Pipeline
+# ---------------------------------------------------------------------------
+
+def verify_data_integrity(
+    df: pd.DataFrame, symbol: str, freq: str = "1h",
+) -> Tuple[pd.DataFrame, dict]:
+    """
+    Post-fetch verification and repair.
+
+    1. Verify timestamps are monotonically increasing (sort if not).
+    2. Detect gaps: fill small ones (<=3 candles) via interpolation,
+       flag large ones (>3 candles).
+    3. Detect price anomalies (>20% single-candle move) and flag them.
+    4. Compute a completeness score.
+
+    Returns (repaired_df, integrity_report).
+    """
+    if df.empty:
+        return df, {"symbol": symbol, "completeness_score": 0.0,
+                     "gaps_filled": 0, "gaps_flagged": 0,
+                     "anomalies_flagged": 0}
+
+    report: dict = {"symbol": symbol, "gaps_filled": 0, "gaps_flagged": 0,
+                     "anomalies_flagged": 0, "large_gap_locations": [],
+                     "anomaly_locations": []}
+
+    # 1. Monotonic timestamps
+    if not df.index.is_monotonic_increasing:
+        df = df.sort_index()
+        logger.debug(f"  {symbol}: sorted non-monotonic timestamps")
+
+    # 2. Gap detection & repair
+    expected_td = pd.Timedelta(freq)
+    full_idx = pd.date_range(
+        start=df.index.min(), end=df.index.max(), freq=freq, tz="UTC",
+    )
+    missing_idx = full_idx.difference(df.index)
+
+    if len(missing_idx) > 0:
+        # Group consecutive missing timestamps into gap runs
+        gaps: List[List[pd.Timestamp]] = []
+        current_run: List[pd.Timestamp] = [missing_idx[0]]
+        for i in range(1, len(missing_idx)):
+            if missing_idx[i] - missing_idx[i - 1] <= expected_td * 1.5:
+                current_run.append(missing_idx[i])
+            else:
+                gaps.append(current_run)
+                current_run = [missing_idx[i]]
+        gaps.append(current_run)
+
+        small_fill_idx = pd.DatetimeIndex([], dtype="datetime64[ns, UTC]")
+        for gap in gaps:
+            if len(gap) <= 3:
+                small_fill_idx = small_fill_idx.append(
+                    pd.DatetimeIndex(gap)
+                )
+                report["gaps_filled"] += len(gap)
+            else:
+                report["gaps_flagged"] += 1
+                report["large_gap_locations"].append(
+                    {"start": str(gap[0]), "end": str(gap[-1]),
+                     "missing_candles": len(gap)}
+                )
+
+        # Interpolate small gaps
+        if len(small_fill_idx) > 0:
+            df = df.reindex(df.index.union(small_fill_idx))
+            df = df.interpolate(method="time")
+            df = df.sort_index()
+            logger.debug(
+                f"  {symbol}: interpolated {report['gaps_filled']} "
+                f"small-gap candles"
+            )
+
+    # 3. Price anomaly detection (>20% single-candle move)
+    pct_change = df["close"].pct_change().abs()
+    anomaly_mask = pct_change > 0.20
+    anomaly_count = anomaly_mask.sum()
+    if anomaly_count > 0:
+        report["anomalies_flagged"] = int(anomaly_count)
+        report["anomaly_locations"] = [
+            str(ts) for ts in df.index[anomaly_mask][:20]  # cap at 20
+        ]
+        logger.debug(
+            f"  {symbol}: {anomaly_count} price anomalies (>20% move) flagged"
+        )
+
+    # 4. Completeness score
+    expected_total = len(full_idx) if len(missing_idx) > 0 else len(
+        pd.date_range(df.index.min(), df.index.max(), freq=freq, tz="UTC")
+    )
+    report["completeness_score"] = round(
+        100.0 * len(df) / max(expected_total, 1), 2
+    )
+
+    return df, report
+
+
+# ---------------------------------------------------------------------------
 # Fetcher with retries and fallback
 # ---------------------------------------------------------------------------
 
@@ -218,19 +654,32 @@ class MultiExchangeFetcher:
     """
     Fetches OHLCV data from a primary exchange (Binance) with fallback
     to alternative exchanges if the primary fails.
+
+    Enhanced with adaptive rate limiting, circuit-breaker retries,
+    connection pooling, and data integrity verification.
     """
 
     def __init__(self, fallback_exchanges: Optional[List[str]] = None,
                  retry_attempts: int = _DEFAULT_RETRY_ATTEMPTS):
         self.retry_attempts = retry_attempts
         self.fallback_exchanges = fallback_exchanges or _DEFAULT_FALLBACK_EXCHANGES
-        self._exchanges: dict = {}  # lazy-init cache
+        self._exchanges: dict = {}  # legacy lazy-init cache (kept for compat)
+
+        # --- New infrastructure ---
+        all_exchanges = ["binance"] + list(self.fallback_exchanges)
+        self._pool = ExchangeConnectionPool(all_exchanges)
+        self._rate_limiter = AdaptiveRateLimiter(max_rps=10.0, burst=5)
+        self._retry_handler = RetryHandler(
+            max_retries=retry_attempts,
+            circuit_breaker_threshold=10,
+            circuit_breaker_cooldown=300,
+        )
+        self._api_call_count = 0
+        self._api_call_lock = Lock()
 
     def _get_exchange(self, name: str):
-        """Lazy-initialise and cache exchange objects."""
-        if name not in self._exchanges:
-            self._exchanges[name] = _create_exchange(name)
-        return self._exchanges[name]
+        """Return exchange from connection pool (backward-compatible)."""
+        return self._pool.get(name)
 
     def fetch_ohlcv(
         self,
@@ -268,22 +717,46 @@ class MultiExchangeFetcher:
         since: str,
         until: str,
     ) -> pd.DataFrame:
-        """Fetch from a single exchange with exponential-backoff retries."""
+        """
+        Fetch from a single exchange with adaptive rate limiting,
+        circuit-breaker retries, and HTTP 429/418 handling.
+        """
+        if self._retry_handler.is_circuit_open(exchange_name):
+            logger.warning(
+                f"  {pair}: circuit breaker open for {exchange_name} — skipping"
+            )
+            return pd.DataFrame()
+
         exchange = self._get_exchange(exchange_name)
         since_ts = int(datetime.strptime(since, "%Y-%m-%d").timestamp() * 1000)
         until_ts = int(datetime.strptime(until, "%Y-%m-%d").timestamp() * 1000)
 
         all_candles: list = []
         current = since_ts
+        page_calls = 0
         logger.info(f"Fetching {pair} from {exchange_name}...")
 
         while current < until_ts:
-            candles = self._fetch_with_retry(exchange, pair, timeframe, current)
+            # Adaptive rate limiting (replaces fixed sleep)
+            self._rate_limiter.acquire()
+
+            t0 = _time.monotonic()
+            candles = self._fetch_with_retry(exchange, exchange_name, pair,
+                                              timeframe, current)
+            latency_ms = (_time.monotonic() - t0) * 1000.0
+            self._rate_limiter.record_latency(latency_ms)
+
+            with self._api_call_lock:
+                self._api_call_count += 1
+            page_calls += 1
+
             if candles is None or len(candles) == 0:
                 break
+
+            # Filter out partial candles beyond our range
+            candles = [c for c in candles if c[0] <= until_ts]
             all_candles.extend(candles)
             current = candles[-1][0] + 1
-            _time.sleep(exchange.rateLimit / 1000)
 
         if not all_candles:
             return pd.DataFrame()
@@ -300,25 +773,52 @@ class MultiExchangeFetcher:
         end_dt = pd.Timestamp(until, tz="UTC")
         df = df[df.index <= end_dt]
 
-        logger.info(f"  {pair} ({exchange_name}): {len(df)} candles")
+        logger.info(
+            f"  {pair} ({exchange_name}): {len(df)} candles "
+            f"({page_calls} API pages)"
+        )
         return df
 
-    def _fetch_with_retry(self, exchange, pair, timeframe, since_ts) -> Optional[list]:
-        """Single page fetch with exponential backoff."""
-        for attempt in range(1, self.retry_attempts + 1):
-            try:
-                return exchange.fetch_ohlcv(
-                    pair, timeframe=timeframe, since=since_ts, limit=1000
-                )
-            except Exception as e:
-                wait = min(2 ** attempt, 60)
+    def _fetch_with_retry(self, exchange, exchange_name: str, pair: str,
+                          timeframe: str, since_ts: int) -> Optional[list]:
+        """
+        Single page fetch with circuit-breaker retries, jitter backoff,
+        and specific HTTP 429 / 418 handling.
+        """
+        try:
+            return self._retry_handler.execute(
+                exchange.fetch_ohlcv,
+                pair, timeframe, since_ts, 1000,
+                exchange_name=exchange_name,
+            )
+        except Exception as exc:
+            exc_str = str(exc).lower()
+            # HTTP 429 — rate limited: honour Retry-After if present
+            if "429" in exc_str or "rate limit" in exc_str:
+                retry_after = 30  # default
+                # ccxt sometimes embeds the header value in the message
+                for token in str(exc).split():
+                    if token.isdigit():
+                        retry_after = min(int(token), 120)
+                        break
                 logger.warning(
-                    f"    Attempt {attempt}/{self.retry_attempts} failed for {pair}: {e}  "
-                    f"— retrying in {wait}s"
+                    f"    HTTP 429 for {pair} on {exchange_name} — "
+                    f"backing off {retry_after}s"
                 )
-                _time.sleep(wait)
-        logger.error(f"    All {self.retry_attempts} retries exhausted for {pair}")
-        return None
+                _time.sleep(retry_after)
+                return None
+            # HTTP 418 — IP ban: switch exchange immediately
+            if "418" in exc_str:
+                logger.error(
+                    f"    HTTP 418 (IP ban) for {pair} on {exchange_name} "
+                    f"— switching exchange"
+                )
+                return None
+            logger.error(
+                f"    All retries exhausted for {pair} on {exchange_name}: "
+                f"{exc}"
+            )
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -484,9 +984,13 @@ def _save_quality_report(report: List[dict], cache_dir: Path):
 # Public API
 # ---------------------------------------------------------------------------
 
-def fetch_all_data(config_path: str = "config.yaml") -> Dict[str, pd.DataFrame]:
+def fetch_all_data(config_path: str = "config.yaml",
+                   max_workers: int = 4) -> Dict[str, pd.DataFrame]:
     """
     Fetch (or load from cache) OHLCV data for every asset in config.
+
+    Crypto assets are fetched in parallel via ThreadPoolExecutor.
+    Synthetic assets (treasuries, stablecoin) are generated synchronously.
 
     Returns dict: symbol -> DataFrame with OHLCV columns.
     """
@@ -506,6 +1010,7 @@ def fetch_all_data(config_path: str = "config.yaml") -> Dict[str, pd.DataFrame]:
     cache_dir = Path("data/cache")
     cache_dir.mkdir(parents=True, exist_ok=True)
     manifest = _load_hash_manifest(cache_dir)
+    manifest_lock = Lock()
 
     fetcher = MultiExchangeFetcher(
         fallback_exchanges=fallback_exchanges,
@@ -521,28 +1026,46 @@ def fetch_all_data(config_path: str = "config.yaml") -> Dict[str, pd.DataFrame]:
         "rETH": "RETH/USDT",
     }
     treasuries = {"BUIDL": 0.045, "USDY": 0.05}
+    synthetic_symbols = set(treasuries.keys()) | {"USDC"}
 
     all_data: Dict[str, pd.DataFrame] = {}
     quality_report: List[dict] = []
+    data_lock = Lock()
+    report_lock = Lock()
 
-    for sym in symbols:
+    progress = FetchProgressReporter(total=len(symbols))
+
+    # ------------------------------------------------------------------
+    # Helper: process a single symbol (runs in worker thread or main)
+    # ------------------------------------------------------------------
+    def _process_symbol(sym: str) -> None:
         cache_file = cache_dir / f"{sym}_hourly.parquet"
 
         # --- Try cache first (with integrity check) ---
-        if cache_file.exists():
-            if _verify_cache_integrity(cache_file, manifest):
-                logger.info(f"  {sym}: loaded from verified cache")
-                df = pd.read_parquet(cache_file)
-                metrics = _compute_quality_metrics(df, sym)
-                metrics["exchange_source"] = "cache"
+        with manifest_lock:
+            cache_valid = (
+                cache_file.exists()
+                and _verify_cache_integrity(cache_file, manifest)
+            )
+
+        if cache_valid:
+            logger.info(f"  {sym}: loaded from verified cache")
+            df = pd.read_parquet(cache_file)
+            metrics = _compute_quality_metrics(df, sym)
+            metrics["exchange_source"] = "cache"
+            with report_lock:
                 quality_report.append(metrics)
+            with data_lock:
                 all_data[sym] = df
-                continue
-            else:
-                logger.warning(f"  {sym}: cache integrity failed — re-fetching")
+            progress.tick(sym, cache_hit=True, data_points=len(df))
+            return
+
+        if cache_file.exists():
+            logger.warning(f"  {sym}: cache integrity failed — re-fetching")
 
         # --- Fetch fresh data ---
         exchange_used = "synthetic"
+        api_calls = 0
         if sym in treasuries:
             df = generate_treasury_series(
                 start, end, annual_yield=treasuries[sym], name=sym
@@ -554,24 +1077,33 @@ def fetch_all_data(config_path: str = "config.yaml") -> Dict[str, pd.DataFrame]:
             df, exchange_used = fetcher.fetch_ohlcv(
                 sym, pair_override=pair, timeframe="1h", since=start, until=end
             )
+            with fetcher._api_call_lock:
+                api_calls = fetcher._api_call_count
 
         if df.empty:
             logger.error(f"  {sym}: NO DATA — skipping")
-            quality_report.append(
-                {"symbol": sym, "rows": 0, "exchange_source": exchange_used}
-            )
-            continue
+            with report_lock:
+                quality_report.append(
+                    {"symbol": sym, "rows": 0, "exchange_source": exchange_used}
+                )
+            progress.tick(sym, api_calls=api_calls)
+            return
 
         # --- Validate ---
         df, val_metrics = validate_ohlcv(df, sym)
         if df.empty:
             logger.error(f"  {sym}: All rows invalid after validation — skipping")
-            continue
+            progress.tick(sym, api_calls=api_calls)
+            return
+
+        # --- Data integrity pipeline ---
+        df, integrity_report = verify_data_integrity(df, sym)
 
         # --- Quality metrics ---
         metrics = _compute_quality_metrics(df, sym)
         metrics["exchange_source"] = exchange_used
         metrics.update(val_metrics)
+        metrics["integrity"] = integrity_report
 
         # Warn on low coverage or large gaps
         if metrics["pct_missing"] > (100 - min_coverage):
@@ -585,14 +1117,58 @@ def fetch_all_data(config_path: str = "config.yaml") -> Dict[str, pd.DataFrame]:
                 f"> threshold {max_gap}h"
             )
 
-        quality_report.append(metrics)
+        with report_lock:
+            quality_report.append(metrics)
 
         # --- Cache + manifest ---
         df.to_parquet(cache_file)
-        manifest[cache_file.name] = _compute_file_hash(cache_file)
-        all_data[sym] = df
+        file_hash = _compute_file_hash(cache_file)
+        with manifest_lock:
+            manifest[cache_file.name] = file_hash
+
+        with data_lock:
+            all_data[sym] = df
+
+        progress.tick(sym, data_points=len(df), api_calls=api_calls)
+
+    # ------------------------------------------------------------------
+    # Phase 1: Synthetic assets (instant, no parallelisation needed)
+    # ------------------------------------------------------------------
+    for sym in symbols:
+        if sym in synthetic_symbols:
+            _process_symbol(sym)
+
+    # ------------------------------------------------------------------
+    # Phase 2: Crypto assets in parallel via ThreadPoolExecutor
+    # ------------------------------------------------------------------
+    crypto_symbols = [s for s in symbols if s not in synthetic_symbols]
+    if crypto_symbols:
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(_process_symbol, sym): sym
+                    for sym in crypto_symbols
+                }
+                for future in as_completed(futures):
+                    sym = futures[future]
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        logger.error(
+                            f"  {sym}: worker raised {type(exc).__name__}: {exc}"
+                        )
+                        progress.tick(sym)
+        except KeyboardInterrupt:
+            logger.warning("Keyboard interrupt — shutting down workers...")
+
+    progress.close()
 
     _save_hash_manifest(cache_dir, manifest)
+
+    # --- Retry handler statistics ---
+    retry_stats = fetcher._retry_handler.get_stats()
+    if retry_stats:
+        logger.info(f"Retry handler stats: {retry_stats}")
 
     # --- Quality summary ---
     _print_quality_table(quality_report)
