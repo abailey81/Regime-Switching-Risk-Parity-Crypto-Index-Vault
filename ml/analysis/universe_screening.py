@@ -320,8 +320,26 @@ class UniverseScreener:
 
         import ccxt
 
-        _safe_log("Stage 1: Fetching universe from Binance...")
-        exchange = ccxt.binance({"enableRateLimit": True})
+        # Try multiple exchanges — Binance is geo-blocked in some regions (UK, etc.)
+        _exchange_priority = ["bybit", "gate", "binanceus", "binance", "okx"]
+        exchange = None
+        for _exch_name in _exchange_priority:
+            try:
+                _cls = getattr(ccxt, _exch_name, None)
+                if _cls is None:
+                    continue
+                _safe_log(f"Stage 1: Trying {_exch_name}...")
+                exchange = _cls({"enableRateLimit": True})
+                exchange.load_markets()
+                _safe_log(f"Stage 1: Connected to {_exch_name} ({len(exchange.markets)} markets)")
+                self._connected_exchange = _exch_name
+                break
+            except Exception as _e:
+                _safe_log(f"Stage 1: {_exch_name} failed ({_e}), trying next...", "warning")
+                exchange = None
+        if exchange is None:
+            _safe_log("Stage 1: All exchanges failed!", "error")
+            return pd.DataFrame(columns=["symbol", "volume_24h", "market_cap", "exchange"])
         exchange.load_markets()
 
         records = []
@@ -453,7 +471,10 @@ class UniverseScreener:
             """Fetch OHLCV for a single symbol. Thread-safe with per-call delay."""
             _time.sleep(_REQUEST_DELAY_S)
             try:
-                ex = ccxt.binance({"enableRateLimit": True})
+                # Use the same exchange that worked for universe fetch
+                _exch_name = getattr(self, '_connected_exchange', 'bybit')
+                _cls = getattr(ccxt, _exch_name, ccxt.bybit)
+                ex = _cls({"enableRateLimit": True})
                 pair = f"{sym}/USDT"
                 all_candles = []
                 current_ts = since_ts

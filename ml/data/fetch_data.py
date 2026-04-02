@@ -666,7 +666,7 @@ class MultiExchangeFetcher:
         self._exchanges: dict = {}  # legacy lazy-init cache (kept for compat)
 
         # --- New infrastructure ---
-        all_exchanges = ["binance"] + list(self.fallback_exchanges)
+        all_exchanges = ["bybit", "gate", "binanceus", "binance"] + list(self.fallback_exchanges)
         self._pool = ExchangeConnectionPool(all_exchanges)
         self._rate_limiter = AdaptiveRateLimiter(max_rps=10.0, burst=5)
         self._retry_handler = RetryHandler(
@@ -695,8 +695,8 @@ class MultiExchangeFetcher:
         Returns (df, exchange_used).  ``exchange_used`` is a string like
         "binance" or "kraken".
         """
-        exchange_order = ["binance"] + [
-            e for e in self.fallback_exchanges if e != "binance"
+        exchange_order = ["bybit", "gate", "binanceus", "binance"] + [
+            e for e in self.fallback_exchanges if e not in ("binance", "bybit", "gate", "binanceus")
         ]
 
         for exch_name in exchange_order:
