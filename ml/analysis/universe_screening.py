@@ -739,120 +739,125 @@ class UniverseScreener:
             return data
 
         # ══════════════════════════════════════════════════════════════
-        # PRIMARY SOURCE: CoinGecko (guaranteed data for listed coins)
+        # PRIMARY SOURCE: Yahoo Finance (no rate limits, bulk download)
         # ══════════════════════════════════════════════════════════════
         #
-        # CoinGecko's /coins/{id}/ohlc endpoint returns OHLC data for
-        # any listed coin. Unlike exchange APIs, this ALWAYS has data
-        # if the coin exists on CoinGecko.
-        #
-        # Strategy: fetch CoinGecko coin list once → map symbols to IDs
-        # → fetch OHLC in parallel → fall back to ccxt for any misses
+        # yfinance supports bulk historical data for 500+ cryptos via
+        # {SYMBOL}-USD tickers. No API key needed. No rate limits.
+        # Downloads in batches of 50 tickers at once (extremely fast).
 
-        _CG_BASE = "https://api.coingecko.com/api/v3"
-        _cg_api_key = None
-        _dotenv_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__)))), ".env")
-        if os.path.exists(_dotenv_path):
-            with open(_dotenv_path) as _ef:
-                for _line in _ef:
-                    if _line.strip().startswith("COINGECKO_API_KEY="):
-                        _cg_api_key = _line.strip().split("=", 1)[1]
-                        break
+        _safe_log(f"Stage 2: Phase 1 — Yahoo Finance bulk download for {len(symbols_to_fetch)} assets...")
 
-        _cg_headers = {}
-        if _cg_api_key:
-            _cg_headers["x-cg-demo-api-key"] = _cg_api_key
-            _safe_log("Stage 2: CoinGecko API key found (higher rate limits)")
-
-        # Build symbol → CoinGecko ID mapping
-        _safe_log("Stage 2: Building CoinGecko symbol map...")
-        _sym_to_cg_id: Dict[str, str] = {}
         try:
-            resp = _requests.get(f"{_CG_BASE}/coins/list", headers=_cg_headers, timeout=30)
-            if resp.status_code == 200:
-                for coin in resp.json():
-                    sym_upper = coin.get("symbol", "").upper()
-                    cg_id = coin.get("id", "")
-                    # Prefer the most well-known ID per symbol
-                    if sym_upper not in _sym_to_cg_id or len(cg_id) < len(_sym_to_cg_id[sym_upper]):
-                        _sym_to_cg_id[sym_upper] = cg_id
-                _safe_log(f"Stage 2: CoinGecko map: {len(_sym_to_cg_id)} symbols")
-            else:
-                _safe_log(f"Stage 2: CoinGecko coin list failed ({resp.status_code})", "warning")
-        except Exception as e:
-            _safe_log(f"Stage 2: CoinGecko coin list error: {e}", "warning")
+            import yfinance as yf
+        except ImportError:
+            yf = None
+            _safe_log("Stage 2: yfinance not installed, skipping Yahoo Finance", "warning")
 
-        _cg_rate_limiter = _ExchangeRateLimiter("coingecko", max_rps=10.0 if _cg_api_key else 5.0, burst=3)
-        _cg_retry = _RetryWithCircuitBreaker(max_retries=2, cb_threshold=20, cb_cooldown=60)
+        _yf_succeeded = 0
+        _yf_failed_syms: List[str] = []
 
-        def _fetch_from_coingecko(sym: str) -> Optional[pd.DataFrame]:
-            """Fetch daily OHLC from CoinGecko for a single symbol."""
-            cg_id = _sym_to_cg_id.get(sym.upper())
-            if not cg_id:
-                return None
+        if yf is not None:
+            # Build Yahoo Finance tickers: BTC → BTC-USD
+            _yf_tickers = [f"{sym}-USD" for sym in symbols_to_fetch]
+            _sym_to_yf = {f"{sym}-USD": sym for sym in symbols_to_fetch}
 
-            _cg_rate_limiter.acquire()
+            # Download in batches of 50 (yfinance handles this efficiently)
+            _batch_size = 50
+            _batches = [_yf_tickers[i:i + _batch_size] for i in range(0, len(_yf_tickers), _batch_size)]
 
-            def _do_fetch():
-                url = f"{_CG_BASE}/coins/{cg_id}/ohlc"
-                params = {"vs_currency": "usd", "days": str(lookback_days)}
-                r = _requests.get(url, params=params, headers=_cg_headers, timeout=30)
-                if r.status_code == 429:
-                    raise Exception("429 rate limit")
-                r.raise_for_status()
-                return r.json()
+            yf_bar = tqdm(total=len(symbols_to_fetch), desc="Yahoo Finance", unit="asset", leave=True)
 
-            raw = _cg_retry.execute(_do_fetch, exchange_name="coingecko", rate_limiter=_cg_rate_limiter)
-            if raw is None or not isinstance(raw, list) or len(raw) < 30:
-                return None
-
-            df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close"])
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-            df = df.set_index("timestamp").sort_index()
-            df = df[~df.index.duplicated(keep="first")]
-            df["volume"] = 0.0  # CoinGecko OHLC doesn't include volume
-            df["volume_usd"] = 0.0
-            return df
-
-        # Phase 1: Fetch from CoinGecko (guaranteed source) in parallel
-        _safe_log(f"Stage 2: Phase 1 — CoinGecko OHLC for {len(symbols_to_fetch)} assets...")
-        _cg_succeeded = 0
-        _cg_failed_syms: List[str] = []
-
-        cg_bar = tqdm(total=len(symbols_to_fetch), desc="CoinGecko OHLC", unit="asset", leave=True)
-
-        with ThreadPoolExecutor(max_workers=6) as cg_pool:
-            cg_futures = {cg_pool.submit(_fetch_from_coingecko, sym): sym for sym in symbols_to_fetch}
-            for fut in as_completed(cg_futures):
-                sym = cg_futures[fut]
+            for batch in _batches:
                 try:
-                    df = fut.result()
-                    if df is not None and len(df) >= 30:
-                        # Cache
-                        cache_file = ohlcv_cache_dir / f"{sym}_daily.parquet"
-                        df.to_parquet(cache_file)
-                        data[sym] = df
-                        _cg_succeeded += 1
-                    else:
-                        _cg_failed_syms.append(sym)
-                except Exception:
-                    _cg_failed_syms.append(sym)
-                cg_bar.set_postfix(ok=_cg_succeeded, fail=len(_cg_failed_syms))
-                cg_bar.update(1)
-        cg_bar.close()
+                    batch_str = " ".join(batch)
+                    df_all = yf.download(
+                        batch_str,
+                        start=since_date,
+                        end=until_date,
+                        interval="1d",
+                        group_by="ticker",
+                        progress=False,
+                        threads=True,
+                    )
 
-        _safe_log(f"Stage 2: CoinGecko — {_cg_succeeded} succeeded, {len(_cg_failed_syms)} to try via exchanges")
+                    for yf_ticker in batch:
+                        sym = _sym_to_yf[yf_ticker]
+                        try:
+                            if len(batch) == 1:
+                                df_single = df_all.copy()
+                            else:
+                                df_single = df_all[yf_ticker].copy() if yf_ticker in df_all.columns.get_level_values(0) else pd.DataFrame()
 
-        # Update symbols_to_fetch to only include CoinGecko failures
-        symbols_to_fetch = _cg_failed_syms
+                            if df_single.empty or len(df_single.dropna()) < 30:
+                                _yf_failed_syms.append(sym)
+                                yf_bar.update(1)
+                                continue
+
+                            df_single = df_single.dropna()
+                            df_single.index = pd.to_datetime(df_single.index, utc=True)
+
+                            # Standardize column names
+                            col_map = {}
+                            for c in df_single.columns:
+                                cl = str(c).lower()
+                                if "open" in cl:
+                                    col_map[c] = "open"
+                                elif "high" in cl:
+                                    col_map[c] = "high"
+                                elif "low" in cl:
+                                    col_map[c] = "low"
+                                elif "close" in cl and "adj" not in cl:
+                                    col_map[c] = "close"
+                                elif "volume" in cl:
+                                    col_map[c] = "volume"
+                            df_single = df_single.rename(columns=col_map)
+
+                            for needed in ["open", "high", "low", "close"]:
+                                if needed not in df_single.columns:
+                                    raise KeyError(f"Missing {needed}")
+
+                            if "volume" not in df_single.columns:
+                                df_single["volume"] = 0.0
+                            df_single["volume_usd"] = df_single["close"] * df_single["volume"]
+
+                            df_single = df_single[["open", "high", "low", "close", "volume", "volume_usd"]]
+                            df_single = df_single[~df_single.index.duplicated(keep="first")]
+
+                            # Cache
+                            cache_file = ohlcv_cache_dir / f"{sym}_daily.parquet"
+                            df_single.to_parquet(cache_file)
+                            data[sym] = df_single
+                            _yf_succeeded += 1
+
+                        except Exception:
+                            _yf_failed_syms.append(sym)
+
+                        yf_bar.set_postfix(ok=_yf_succeeded, fail=len(_yf_failed_syms))
+                        yf_bar.update(1)
+
+                except Exception as e:
+                    # Entire batch failed
+                    for yf_ticker in batch:
+                        sym = _sym_to_yf[yf_ticker]
+                        if sym not in data:
+                            _yf_failed_syms.append(sym)
+                        yf_bar.update(1)
+
+            yf_bar.close()
+            _safe_log(f"Stage 2: Yahoo Finance — {_yf_succeeded} succeeded, {len(_yf_failed_syms)} failed")
+        else:
+            _yf_failed_syms = list(symbols_to_fetch)
+
+        # Update remaining symbols
+        symbols_to_fetch = _yf_failed_syms
 
         if not symbols_to_fetch:
             self.ohlcv_data = data
-            _safe_log(f"Stage 2: All {len(data)} assets fetched via CoinGecko")
+            _safe_log(f"Stage 2: All {len(data)} assets fetched (Yahoo Finance: {_yf_succeeded}, cache: {cached_count})")
             return data
 
-        # Phase 2: Exchange fallback for CoinGecko failures
+        # Phase 2: Exchange cascade fallback for Yahoo Finance failures
         _safe_log(f"Stage 2: Phase 2 — Exchange fallback for {len(symbols_to_fetch)} remaining assets...")
 
         # Reuse authenticated exchanges from Stage 1, create pools for parallel fetching
