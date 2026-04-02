@@ -492,10 +492,13 @@ class UniverseScreener:
 
     def fetch_universe(self, top_n: int = 1000) -> pd.DataFrame:
         """
-        Fetch the top-N USDT trading pairs from Binance by 24h quote volume.
+        Fetch the top-N cryptocurrencies by market cap from CoinGecko.
 
-        Queries the Binance spot market for all active USDT pairs, sorts by
-        24h volume (in USDT terms), and returns the top ``top_n`` assets.
+        Uses CoinGecko's /coins/markets endpoint which returns REAL coins
+        ranked by market cap — no leveraged tokens, no derivatives, no dead
+        coins. Each page returns 250 coins. Guaranteed to have price data.
+
+        Falls back to exchange scanning if CoinGecko fails.
 
         Parameters
         ----------
@@ -505,7 +508,7 @@ class UniverseScreener:
         Returns
         -------
         pd.DataFrame
-            Columns: symbol, pair, volume_24h_usd, last_price, exchange.
+            Columns: symbol, volume_24h_usd, market_cap, last_price, cg_id.
         """
         cache_path = self.cache_dir / "universe_list.json"
         cached = _load_cache_json(cache_path)
@@ -515,6 +518,91 @@ class UniverseScreener:
             _safe_log(f"Stage 1: Loaded {len(df)} assets from cache")
             return df
 
+        import requests as _req
+
+        # ── PRIMARY: CoinGecko /coins/markets (real coins by market cap) ──
+        _CG_BASE = "https://api.coingecko.com/api/v3"
+        _cg_headers = {}
+        _dotenv_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))), ".env")
+        if os.path.exists(_dotenv_path):
+            with open(_dotenv_path) as _ef:
+                for _line in _ef:
+                    if _line.strip().startswith("COINGECKO_API_KEY="):
+                        _cg_headers["x-cg-demo-api-key"] = _line.strip().split("=", 1)[1]
+                        break
+
+        _safe_log(f"Stage 1: Fetching top {top_n} coins by market cap from CoinGecko...")
+
+        records = []
+        pages_needed = (top_n + 249) // 250  # 250 per page
+        cg_ok = True
+
+        for page in range(1, pages_needed + 1):
+            _time.sleep(1.5)  # CoinGecko rate limit
+            try:
+                r = _req.get(f"{_CG_BASE}/coins/markets", params={
+                    "vs_currency": "usd",
+                    "order": "market_cap_desc",
+                    "per_page": 250,
+                    "page": page,
+                    "sparkline": "false",
+                }, headers=_cg_headers, timeout=30)
+
+                if r.status_code == 429:
+                    _safe_log(f"Stage 1: CoinGecko 429 on page {page}, waiting 60s...")
+                    _time.sleep(60)
+                    r = _req.get(f"{_CG_BASE}/coins/markets", params={
+                        "vs_currency": "usd",
+                        "order": "market_cap_desc",
+                        "per_page": 250,
+                        "page": page,
+                        "sparkline": "false",
+                    }, headers=_cg_headers, timeout=30)
+
+                if r.status_code != 200:
+                    _safe_log(f"Stage 1: CoinGecko page {page} failed ({r.status_code})", "warning")
+                    cg_ok = False
+                    break
+
+                coins = r.json()
+                if not coins:
+                    break
+
+                for coin in coins:
+                    sym = coin.get("symbol", "").upper()
+                    if sym in _STABLECOINS:
+                        continue
+                    records.append({
+                        "symbol": sym,
+                        "cg_id": coin.get("id", ""),
+                        "volume_24h_usd": float(coin.get("total_volume", 0) or 0),
+                        "market_cap": float(coin.get("market_cap", 0) or 0),
+                        "last_price": float(coin.get("current_price", 0) or 0),
+                    })
+
+                _safe_log(f"  Page {page}/{pages_needed}: {len(coins)} coins (total: {len(records)})")
+
+            except Exception as e:
+                _safe_log(f"Stage 1: CoinGecko page {page} error: {e}", "warning")
+                cg_ok = False
+                break
+
+        if records:
+            df = pd.DataFrame(records)
+            df = df.drop_duplicates(subset="symbol", keep="first")
+            df = df.head(top_n).reset_index(drop=True)
+            self.universe_df = df
+
+            # Store CoinGecko ID mapping for Stage 2
+            self._cg_id_map = dict(zip(df["symbol"], df["cg_id"]))
+
+            _save_cache_json(cache_path, df.to_dict(orient="records"))
+            _safe_log(f"Stage 1: Universe: {len(df)} real coins by market cap")
+            return df
+
+        # ── FALLBACK: Exchange scanning (if CoinGecko failed completely) ──
+        _safe_log("Stage 1: CoinGecko failed, falling back to exchange scanning...")
         import ccxt
 
         # ── Load API keys from environment for authenticated (faster) connections ──
