@@ -768,10 +768,13 @@ class UniverseScreener:
         lookback_days: int = 365,
     ) -> Dict[str, pd.DataFrame]:
         """
-        Fetch daily OHLCV data for all symbols with concurrent fetching.
+        Fetch daily OHLCV data using a 3-tier parallel cascade:
 
-        Uses ThreadPoolExecutor with 10 workers and 50ms inter-request delay
-        for Binance rate-limit compliance. Each asset's data is cached
+          1. CryptoCompare (primary): 5,700+ coins, 1 call = 2000 days, ~20 req/s
+          2. Yahoo Finance (secondary): 500+ cryptos via {SYM}-USD tickers
+          3. CoinGecko (tertiary): 18,000+ coins, 1 req/sec
+
+        All tiers run in parallel where possible. Each asset is cached
         individually as a parquet file.
 
         Parameters
@@ -786,8 +789,7 @@ class UniverseScreener:
         dict
             symbol -> pd.DataFrame with OHLCV columns.
         """
-        import ccxt
-        import requests as _requests
+        import requests as _req
 
         _safe_log(f"Stage 2: Fetching daily OHLCV for {len(symbols)} assets "
                    f"({lookback_days}d lookback)...")
@@ -827,8 +829,90 @@ class UniverseScreener:
             return data
 
         # ══════════════════════════════════════════════════════════════
-        # PRIMARY SOURCE: Yahoo Finance (no rate limits, bulk download)
+        # 3-TIER PARALLEL FETCH: CryptoCompare → Yahoo Finance → CoinGecko
         # ══════════════════════════════════════════════════════════════
+
+        # Load API keys from .env
+        _dotenv_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))), ".env")
+        _env_keys: Dict[str, str] = {}
+        if os.path.exists(_dotenv_path):
+            with open(_dotenv_path) as _ef:
+                for _line in _ef:
+                    _line = _line.strip()
+                    if _line and not _line.startswith("#") and "=" in _line:
+                        _k, _v = _line.split("=", 1)
+                        _env_keys[_k.strip()] = _v.strip()
+
+        # ── TIER 1: CryptoCompare (5,700+ coins, 1 call = 2000 days, ~20 req/s) ──
+        _CC_KEY = _env_keys.get("CRYPTOCOMPARE_API_KEY", "")
+        _cc_succeeded = 0
+        _cc_failed_syms: List[str] = []
+
+        if _CC_KEY:
+            _safe_log(f"Stage 2: Tier 1 — CryptoCompare for {len(symbols_to_fetch)} assets (parallel, ~20 req/s)...")
+            _CC_BASE = "https://min-api.cryptocompare.com/data/v2/histoday"
+
+            def _fetch_from_cc(sym: str) -> Tuple[str, Optional[pd.DataFrame]]:
+                """Fetch daily OHLCV from CryptoCompare. One call = up to 2000 days."""
+                try:
+                    r = _req.get(_CC_BASE, params={
+                        "fsym": sym, "tsym": "USD",
+                        "limit": min(lookback_days, 2000),
+                        "api_key": _CC_KEY,
+                    }, timeout=15)
+                    if r.status_code != 200:
+                        return sym, None
+                    body = r.json()
+                    if body.get("Response") != "Success":
+                        return sym, None
+                    raw = body.get("Data", {}).get("Data", [])
+                    if not raw or len(raw) < 30:
+                        return sym, None
+
+                    df = pd.DataFrame(raw)
+                    df["timestamp"] = pd.to_datetime(df["time"], unit="s", utc=True)
+                    df = df.set_index("timestamp").sort_index()
+                    df = df.rename(columns={"volumefrom": "volume_base", "volumeto": "volume"})
+                    df["volume_usd"] = df["volume"]
+                    df = df[["open", "high", "low", "close", "volume", "volume_usd"]]
+                    df = df[df["close"] > 0]  # Remove zero-price rows
+                    df = df[~df.index.duplicated(keep="first")]
+
+                    if len(df) < 30:
+                        return sym, None
+
+                    cache_file = ohlcv_cache_dir / f"{sym}_daily.parquet"
+                    df.to_parquet(cache_file)
+                    return sym, df
+                except Exception:
+                    return sym, None
+
+            cc_bar = tqdm(total=len(symbols_to_fetch), desc="CryptoCompare", unit="asset", leave=True)
+            with ThreadPoolExecutor(max_workers=15) as cc_pool:
+                cc_futs = {cc_pool.submit(_fetch_from_cc, sym): sym for sym in symbols_to_fetch}
+                for fut in as_completed(cc_futs):
+                    sym, df = fut.result()
+                    if df is not None:
+                        data[sym] = df
+                        _cc_succeeded += 1
+                    else:
+                        _cc_failed_syms.append(sym)
+                    cc_bar.set_postfix(ok=_cc_succeeded, fail=len(_cc_failed_syms))
+                    cc_bar.update(1)
+            cc_bar.close()
+            _safe_log(f"Stage 2: CryptoCompare — {_cc_succeeded} succeeded, {len(_cc_failed_syms)} failed")
+            symbols_to_fetch = _cc_failed_syms
+        else:
+            _safe_log("Stage 2: No CryptoCompare API key, skipping Tier 1", "warning")
+
+        if not symbols_to_fetch:
+            self.ohlcv_data = data
+            _safe_log(f"Stage 2: Complete — {len(data)} assets (CC: {_cc_succeeded}, cache: {cached_count})")
+            return data
+
+        # ── TIER 2: Yahoo Finance (bulk batch download, no rate limits) ──
+        _safe_log(f"Stage 2: Tier 2 — Yahoo Finance for {len(symbols_to_fetch)} remaining assets...")
         #
         # yfinance supports bulk historical data for 500+ cryptos via
         # {SYMBOL}-USD tickers. No API key needed. No rate limits.
@@ -1061,11 +1145,11 @@ class UniverseScreener:
 
         self.ohlcv_data = data
         _safe_log(f"Stage 2: TOTAL — {len(data)} assets "
-                   f"(YF: {_yf_succeeded}, CG: {_cg2_ok}, cache: {cached_count}, "
-                   f"leveraged skipped: {_leveraged_skipped})")
+                   f"(CC: {_cc_succeeded}, YF: {_yf_succeeded}, CG: {_cg2_ok}, "
+                   f"cache: {cached_count}, leveraged skipped: {_leveraged_skipped})")
         return data
 
-        # ── Phase 3 (below) only runs if Phase 2 is skipped ──
+        # ── Dead code below — exchange cascade kept for reference ──
         _safe_log(f"Stage 2: Exchange cascade for remaining assets...")
 
         # Reuse authenticated exchanges from Stage 1, create pools for parallel fetching
