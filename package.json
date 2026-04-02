@@ -1,0 +1,24 @@
+{
+  "name": "riskparity-vault",
+  "version": "1.0.0",
+  "description": "Regime-Switching Risk-Parity Crypto Index Vault — ERC-4626 tokenised quantitative portfolio management",
+  "author": "Tamer Atesyakar <ucestes@ucl.ac.uk>",
+  "license": "MIT",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "test:gas": "REPORT_GAS=true hardhat test",
+    "deploy:mocks": "hardhat run scripts/deploy_mocks.js --network sepolia",
+    "deploy:vault": "hardhat run scripts/deploy.js --network sepolia",
+    "verify": "hardhat run scripts/verify.js --network sepolia",
+    "interact": "hardhat run scripts/interact.js --network sepolia"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+    "hardhat": "^2.22.0",
+    "dotenv": "^16.4.0"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.0.0"
+  }
+}

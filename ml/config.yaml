@@ -1,0 +1,51 @@
+data:
+  assets: ["BTC", "ETH", "SOL", "stETH", "rETH", "BUIDL", "USDY", "USDC"]
+  start_date: "2022-01-01"
+  end_date: "2025-12-31"
+  frequency: "1h"
+  source: "binance"
+
+garch:
+  p: 1
+  q: 1
+  distribution: "studentst"
+  rolling_window: 1440
+  refit_frequency: 168
+
+hmm:
+  n_states: 3
+  covariance_type: "full"
+  n_iter: 200
+  features: ["log_returns_mean_24h", "realised_vol_120h", "volume_ratio_480h"]
+
+rl:
+  algorithm: "SAC"
+  state_dim: 38
+  action_dim: 8
+  training:
+    total_timesteps: 500000
+    learning_rate: 0.0003
+    batch_size: 256
+    n_seeds: 5
+
+ensemble:
+  method: "inverse_variance"
+  cvar_confidence: 0.05
+  max_single_asset: 0.40
+  min_single_asset: 0.02
+  max_turnover: 0.30
+  circuit_breaker:
+    drawdown_threshold: 0.15
+    defensive_weights: { BTC: 0.05, ETH: 0.05, SOL: 0.00, stETH: 0.05, rETH: 0.05, BUIDL: 0.35, USDY: 0.15, USDC: 0.30 }
+
+risk_budgets:
+  bull:   { crypto: 0.70, staking: 0.20, treasuries: 0.00, stable: 0.10 }
+  normal: { crypto: 0.40, staking: 0.30, treasuries: 0.20, stable: 0.10 }
+  crisis: { crypto: 0.10, staking: 0.10, treasuries: 0.50, stable: 0.30 }
+
+backtest:
+  train_window: 4320
+  test_window: 720
+  step_size: 720
+  transaction_cost_bps: 10
+  monte_carlo_sims: 10000
