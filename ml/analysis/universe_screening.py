@@ -907,32 +907,46 @@ class UniverseScreener:
 
         _cg2_ok = 0
         _cg2_fail = 0
-        cg2_bar = tqdm(symbols_to_fetch, desc="CoinGecko (1/sec)", unit="asset", leave=True)
+        _cg2_consecutive_fails = 0
+        _CG2_GIVE_UP_AFTER = 30  # Stop after 30 consecutive failures (data doesn't exist)
+
+        import requests as _req
+
+        cg2_bar = tqdm(symbols_to_fetch, desc="CoinGecko fallback", unit="asset", leave=True)
         for sym in cg2_bar:
+            # Early exit: if 30 consecutive fails, the remaining are all dead tokens
+            if _cg2_consecutive_fails >= _CG2_GIVE_UP_AFTER:
+                _remaining = len(symbols_to_fetch) - (_cg2_ok + _cg2_fail)
+                _safe_log(f"Stage 2: CoinGecko — {_cg2_consecutive_fails} consecutive failures, "
+                           f"stopping early ({_remaining} assets skipped as unavailable)")
+                break
+
             cg_id = _sym_to_cg.get(sym.upper())
             if not cg_id:
                 _cg2_fail += 1
-                cg2_bar.set_postfix(ok=_cg2_ok, fail=_cg2_fail, skip="no CG id")
+                _cg2_consecutive_fails += 1
+                cg2_bar.set_postfix(ok=_cg2_ok, fail=_cg2_fail)
                 continue
 
-            _time.sleep(1.1)  # CoinGecko free = 10-30 req/min, 1/sec is safe
+            _time.sleep(1.1)
             try:
-                import requests as _req
                 r = _req.get(f"{_CG_BASE}/coins/{cg_id}/ohlc",
                              params={"vs_currency": "usd", "days": str(lookback_days)},
-                             headers=_cg_headers, timeout=30)
+                             headers=_cg_headers, timeout=15)
                 if r.status_code == 429:
-                    _time.sleep(60)
+                    _time.sleep(30)
                     r = _req.get(f"{_CG_BASE}/coins/{cg_id}/ohlc",
                                  params={"vs_currency": "usd", "days": str(lookback_days)},
-                                 headers=_cg_headers, timeout=30)
+                                 headers=_cg_headers, timeout=15)
                 if r.status_code != 200:
                     _cg2_fail += 1
+                    _cg2_consecutive_fails += 1
                     continue
 
                 raw = r.json()
                 if not isinstance(raw, list) or len(raw) < 30:
                     _cg2_fail += 1
+                    _cg2_consecutive_fails += 1
                     continue
 
                 df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close"])
@@ -946,14 +960,16 @@ class UniverseScreener:
                 df.to_parquet(cache_file)
                 data[sym] = df
                 _cg2_ok += 1
+                _cg2_consecutive_fails = 0  # Reset on success
 
             except Exception:
                 _cg2_fail += 1
+                _cg2_consecutive_fails += 1
 
             cg2_bar.set_postfix(ok=_cg2_ok, fail=_cg2_fail)
 
         cg2_bar.close()
-        _safe_log(f"Stage 2: CoinGecko Phase 2 — {_cg2_ok} succeeded, {_cg2_fail} failed")
+        _safe_log(f"Stage 2: CoinGecko fallback — {_cg2_ok} succeeded, {_cg2_fail} failed")
 
         self.ohlcv_data = data
         _safe_log(f"Stage 2: TOTAL — {len(data)} assets "
