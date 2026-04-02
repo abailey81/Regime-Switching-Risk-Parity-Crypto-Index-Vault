@@ -1,11 +1,11 @@
 <div align="center">
 
-<img src="https://img.shields.io/badge/%E2%9A%A1-Adaptive%20Regime%20Risk%20Parity%20Vault-000000?style=for-the-badge&labelColor=000000" alt="Project Title" />
+<img src="https://img.shields.io/badge/%E2%9A%A1-Regime--Switching%20Risk--Parity%20Crypto%20Index%20Vault-000000?style=for-the-badge&labelColor=000000" alt="Project Title" />
 
 <br />
 
-### Regime-Adaptive ML Risk Parity Engine
-**ERC-4626 Tokenised Crypto Index Vault with GARCH-DCC, Bayesian HMM & Deep RL Ensemble**
+### Regime-Switching Risk-Parity Crypto Index Vault
+**ML-Driven ERC-4626 Tokenised Fund with GARCH-DCC, Bayesian HMM & Deep RL Ensemble**
 
 <br />
 
@@ -312,8 +312,8 @@ Redemption Fee (0.3% within 7 days)
 ### 1. Smart Contracts
 
 ```bash
-git clone https://github.com/abailey81/adaptive-regime-risk-parity-vault.git
-cd adaptive-regime-risk-parity-vault
+git clone https://github.com/abailey81/Regime-Switching-Risk-Parity-Crypto-Index-Vault.git
+cd Regime-Switching-Risk-Parity-Crypto-Index-Vault
 npm install
 cp .env.example .env          # Fill in RPC URL + private key
 
@@ -494,7 +494,7 @@ The backtest evaluates performance across **12 major crypto crises** (2020–202
 ## Repository Structure
 
 ```
-adaptive-regime-risk-parity-vault/
+Regime-Switching-Risk-Parity-Crypto-Index-Vault/
 │
 ├── contracts/                          Solidity (1,026 lines)
 │   ├── RiskParityVault.sol               Core ERC-4626 vault (835 lines)
