@@ -558,7 +558,7 @@ def run_walk_forward(
 
         # ── 1. Fit GARCH-DCC on training window ──
         train_returns = returns_df.iloc[train_start:train_end]
-        garch = StudentTGarchDCC()
+        garch = StudentTGarchDCC(config=config.get("garch", {}))
         try:
             garch.fit(train_returns)
             sigma = garch.forecast_covariance()
@@ -572,7 +572,7 @@ def run_walk_forward(
 
         # ── 2. Fit HMM on training window ──
         train_hmm_feat = hmm_features.iloc[train_start:train_end]
-        hmm_model = BayesianRegimeHMM()
+        hmm_model = BayesianRegimeHMM(config=config.get("hmm", {}))
         try:
             hmm_model.fit(train_hmm_feat)
             hmm_uncertainty = hmm_model.get_uncertainty()

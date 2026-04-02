@@ -794,7 +794,7 @@ contract RiskParityVault is
      *      weights. In circuit breaker mode, defensive weights override the proposed ones.
      *
      *      The Merkle leaf is computed as:
-     *        keccak256(abi.encodePacked(tokens, newWeights))
+     *        keccak256(abi.encode(tokens, newWeights))
      *
      * @param tokens     Array of constituent addresses (must match constituents array length)
      * @param newWeights Array of new weights in basis points (must sum to 10000)
@@ -813,7 +813,7 @@ contract RiskParityVault is
         require(tokens.length == constituents.length, "Must update all constituents");
 
         // Verify Merkle proof
-        bytes32 leaf = keccak256(abi.encodePacked(tokens, newWeights));
+        bytes32 leaf = keccak256(abi.encode(tokens, newWeights));
         require(
             MerkleProof.verify(proof, committedWeightsRoot, leaf),
             "Invalid Merkle proof"

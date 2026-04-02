@@ -107,6 +107,7 @@ def compute_weights(
             p=config.get("garch", {}).get("p", 1),
             q=config.get("garch", {}).get("q", 1),
             distribution=config.get("garch", {}).get("distribution", "studentst"),
+            config=config.get("garch", {}),
         )
         garch.fit(returns_df)
         sigma = garch.forecast_covariance()
@@ -131,6 +132,7 @@ def compute_weights(
     try:
         hmm_model = BayesianRegimeHMM(
             n_states=config.get("hmm", {}).get("n_states", 3),
+            config=config.get("hmm", {}),
         )
         hmm_model.fit(hmm_features)
         regime_probs = hmm_model.predict_proba(hmm_features)

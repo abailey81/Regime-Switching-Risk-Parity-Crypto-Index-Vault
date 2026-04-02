@@ -130,19 +130,26 @@ def compute_merkle_tree(tokens: List[str], weights_bps: List[int]) -> Dict:
 
 def compute_merkle_root(tokens: List[str], weights_bps: List[int]) -> str:
     """
-    Build a Merkle tree and return just the root hash.
+    Compute the Merkle root that matches the on-chain contract.
 
-    Backward-compatible wrapper around compute_merkle_tree().
+    The Solidity contract computes the leaf as:
+        keccak256(abi.encode(tokens, newWeights))
+    which encodes all tokens and weights as a single ABI-encoded payload.
+
+    For the testnet commit-reveal pattern this IS the root (single leaf,
+    empty proof). The multi-leaf tree (compute_merkle_tree) is available
+    for production use with per-asset proofs.
 
     Args:
-        tokens: List of token addresses
+        tokens: List of token addresses (checksummed)
         weights_bps: List of weights in basis points
 
     Returns:
-        Hex string of the Merkle root
+        Hex string of the Merkle root matching on-chain computation
     """
-    result = compute_merkle_tree(tokens, weights_bps)
-    return result["root"]
+    encoded = encode(["address[]", "uint256[]"], [tokens, weights_bps])
+    root = keccak256(encoded)
+    return "0x" + root.hex()
 
 
 def compute_merkle_proof(tokens: List[str], weights_bps: List[int],

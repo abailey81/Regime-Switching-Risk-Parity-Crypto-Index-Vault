@@ -338,16 +338,18 @@ class EnsembleCombiner:
     @staticmethod
     def _assign_regime_labels(regime_probs: np.ndarray) -> np.ndarray:
         """
-        Create a simple regime label array for historical rows.
+        Create regime label array for historical rows.
 
-        When full HMM state sequence is unavailable, uses the dominant
-        regime from current probabilities as a uniform label.  This is
-        a conservative fallback — with a full HMM fit the caller should
-        supply per-row labels directly.
+        If *regime_probs* is 2-D (T x n_states), assigns the argmax regime
+        per row.  If 1-D (single timestep), broadcasts the dominant regime
+        across all rows — conservative fallback when only latest probs are
+        available.
         """
-        dominant = int(np.argmax(regime_probs))
-        # Returns a single-element array; the caller's mask logic handles broadcasting
-        return np.array([dominant])
+        regime_probs = np.atleast_2d(regime_probs)
+        if regime_probs.shape[0] == 1:
+            # Single-timestep: caller will broadcast
+            return np.full(1, int(np.argmax(regime_probs[0])))
+        return np.argmax(regime_probs, axis=1)
 
     # ═══════════════════════════════════════════════════════════════
     # DYNAMIC KELLY FRACTION
