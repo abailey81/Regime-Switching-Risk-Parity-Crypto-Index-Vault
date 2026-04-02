@@ -466,68 +466,100 @@ class UniverseScreener:
             self.ohlcv_data = data
             return data
 
-        # Pre-create a pool of exchange instances (one per worker thread)
-        # Avoids the overhead of load_markets() on every single fetch
-        _exch_name = getattr(self, '_connected_exchange', 'bybit')
+        # Pre-create exchange pools for MULTIPLE exchanges (fallback cascade)
+        _exchange_order = ["bybit", "gate", "binanceus", "okx", "kraken"]
+        # Remove any that failed during Stage 1
+        _primary = getattr(self, '_connected_exchange', 'bybit')
+        if _primary in _exchange_order:
+            _exchange_order.remove(_primary)
+        _exchange_order.insert(0, _primary)
+
         _n_workers = min(20, len(symbols_to_fetch))
-        _exchange_pool: List = []
-        _safe_log(f"Stage 2: Pre-initializing {_n_workers} {_exch_name} connections...")
-        for _ in range(_n_workers):
-            _cls = getattr(ccxt, _exch_name, ccxt.bybit)
-            _exchange_pool.append(_cls({"enableRateLimit": True}))
-        _pool_lock = __import__('threading').Lock()
-        _pool_idx = [0]  # mutable counter for round-robin
-
-        def _get_exchange_from_pool():
-            """Round-robin exchange instance assignment (thread-safe)."""
-            with _pool_lock:
-                idx = _pool_idx[0] % len(_exchange_pool)
-                _pool_idx[0] += 1
-                return _exchange_pool[idx]
-
-        # Concurrent fetching — maximum parallelism
-        def _fetch_single(sym: str) -> Tuple[str, Optional[pd.DataFrame]]:
-            """Fetch OHLCV for a single symbol using pooled exchange instance."""
+        _exchange_pools: Dict[str, List] = {}
+        _safe_log(f"Stage 2: Pre-initializing {_n_workers} connections across {len(_exchange_order)} exchanges...")
+        for _ename in _exchange_order:
             try:
-                ex = _get_exchange_from_pool()
-                pair = f"{sym}/USDT"
-                all_candles = []
-                current_ts = since_ts
+                _cls = getattr(ccxt, _ename, None)
+                if _cls is None:
+                    continue
+                pool_list = []
+                for _ in range(max(4, _n_workers // len(_exchange_order))):
+                    pool_list.append(_cls({"enableRateLimit": True}))
+                _exchange_pools[_ename] = pool_list
+                _safe_log(f"  {_ename}: {len(pool_list)} instances ready")
+            except Exception as _e:
+                _safe_log(f"  {_ename}: failed to initialize ({_e})", "warning")
 
-                while True:
-                    candles = ex.fetch_ohlcv(
-                        pair, timeframe="1d", since=current_ts, limit=1000
+        _pool_lock = __import__('threading').Lock()
+        _pool_counters: Dict[str, int] = {k: 0 for k in _exchange_pools}
+
+        def _get_exchange(exch_name: str):
+            """Round-robin instance from a named exchange pool."""
+            instances = _exchange_pools.get(exch_name, [])
+            if not instances:
+                return None
+            with _pool_lock:
+                idx = _pool_counters.get(exch_name, 0) % len(instances)
+                _pool_counters[exch_name] = idx + 1
+                return instances[idx]
+
+        def _fetch_ohlcv_from(ex, pair: str, since_ts_: int) -> List:
+            """Fetch all candles from a single exchange instance."""
+            all_candles = []
+            current = since_ts_
+            while True:
+                candles = ex.fetch_ohlcv(pair, timeframe="1d", since=current, limit=1000)
+                if not candles:
+                    break
+                all_candles.extend(candles)
+                last_ts = candles[-1][0]
+                if last_ts <= current:
+                    break
+                current = last_ts + 1
+            return all_candles
+
+        # Concurrent fetching with multi-exchange fallback
+        def _fetch_single(sym: str) -> Tuple[str, Optional[pd.DataFrame]]:
+            """Fetch OHLCV trying each exchange until one succeeds."""
+            for exch_name in _exchange_order:
+                ex = _get_exchange(exch_name)
+                if ex is None:
+                    continue
+                try:
+                    # Try USDT pair first, then USD
+                    for quote in ["USDT", "USD"]:
+                        pair = f"{sym}/{quote}"
+                        try:
+                            all_candles = _fetch_ohlcv_from(ex, pair, since_ts)
+                            if all_candles:
+                                break
+                        except Exception:
+                            continue
+                    else:
+                        continue
+
+                    if not all_candles:
+                        continue
+
+                    df = pd.DataFrame(
+                        all_candles,
+                        columns=["timestamp", "open", "high", "low", "close", "volume"],
                     )
-                    if not candles:
-                        break
-                    all_candles.extend(candles)
-                    last_ts = candles[-1][0]
-                    if last_ts <= current_ts:
-                        break
-                    current_ts = last_ts + 1
-                    # ccxt enableRateLimit handles throttling automatically
+                    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+                    df = df.set_index("timestamp").sort_index()
+                    df = df[~df.index.duplicated(keep="first")]
+                    df["volume_usd"] = df["close"] * df["volume"]
 
-                if not all_candles:
-                    return sym, None
+                    # Cache individually
+                    cache_file = ohlcv_cache_dir / f"{sym}_daily.parquet"
+                    df.to_parquet(cache_file)
 
-                df = pd.DataFrame(
-                    all_candles,
-                    columns=["timestamp", "open", "high", "low", "close", "volume"],
-                )
-                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-                df = df.set_index("timestamp").sort_index()
-                df = df[~df.index.duplicated(keep="first")]
-                df["volume_usd"] = df["close"] * df["volume"]
+                    return sym, df
 
-                # Cache individually
-                cache_file = ohlcv_cache_dir / f"{sym}_daily.parquet"
-                df.to_parquet(cache_file)
+                except Exception:
+                    continue
 
-                return sym, df
-
-            except Exception as e:
-                logger.debug("Stage 2: Failed to fetch %s: %s", sym, e)
-                return sym, None
+            return sym, None
 
         # Execute with ThreadPoolExecutor — 20 parallel workers
         max_workers = _n_workers
