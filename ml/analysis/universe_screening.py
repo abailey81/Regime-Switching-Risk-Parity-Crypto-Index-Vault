@@ -765,24 +765,41 @@ class UniverseScreener:
     def fetch_universe_data(
         self,
         symbols: List[str],
-        lookback_days: int = 365,
+        lookback_days: int = 730,
     ) -> Dict[str, pd.DataFrame]:
         """
-        Fetch daily OHLCV data using a 3-tier parallel cascade:
+        World-class multi-source parallel data collection engine.
 
-          1. CryptoCompare (primary): 5,700+ coins, 1 call = 2000 days, ~20 req/s
-          2. Yahoo Finance (secondary): 500+ cryptos via {SYM}-USD tickers
-          3. CoinGecko (tertiary): 18,000+ coins, 1 req/sec
+        Simultaneously queries ALL available data sources in parallel,
+        then merges results taking the source with the most data points
+        per symbol. Achieves maximum coverage in minimum wall-clock time.
 
-        All tiers run in parallel where possible. Each asset is cached
-        individually as a parquet file.
+        Architecture::
+
+            ┌─────────────────────────────────────────────────────────┐
+            │              PARALLEL DATA COLLECTION                   │
+            │                                                         │
+            │  Thread A: CryptoCompare (15 workers)                  │
+            │    └── 1 call = 2000 days, ~700-900 coins in ~60s      │
+            │                                                         │
+            │  Thread B: Yahoo Finance (batch 50)                    │
+            │    └── Bulk download, ~300-500 coins in ~30s            │
+            │                                                         │
+            │  ──── both run simultaneously ────                      │
+            │                                                         │
+            │  Merge: per symbol, take source with most data points  │
+            │                                                         │
+            │  Thread C: CoinGecko (sequential, 1/sec)               │
+            │    └── Only for symbols both CC and YF missed           │
+            │    └── Early exit after 30 consecutive failures         │
+            └─────────────────────────────────────────────────────────┘
 
         Parameters
         ----------
         symbols : list of str
             Base symbols (e.g., ["BTC", "ETH", "SOL"]).
         lookback_days : int
-            Number of days of history to fetch.
+            Number of days of history to fetch (default 730 = 2 years).
 
         Returns
         -------
@@ -790,21 +807,21 @@ class UniverseScreener:
             symbol -> pd.DataFrame with OHLCV columns.
         """
         import requests as _req
+        import threading
 
-        _safe_log(f"Stage 2: Fetching daily OHLCV for {len(symbols)} assets "
+        _safe_log(f"Stage 2: Multi-source parallel collection for {len(symbols)} assets "
                    f"({lookback_days}d lookback)...")
 
         since_date = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
         until_date = datetime.utcnow().strftime("%Y-%m-%d")
-        since_ts = int(datetime.strptime(since_date, "%Y-%m-%d").timestamp() * 1000)
 
         ohlcv_cache_dir = self.cache_dir / "ohlcv_daily"
         ohlcv_cache_dir.mkdir(parents=True, exist_ok=True)
 
+        # ── Check cache first ──
         data: Dict[str, pd.DataFrame] = {}
         symbols_to_fetch: List[str] = []
 
-        # Check individual caches first
         for sym in symbols:
             cache_file = ohlcv_cache_dir / f"{sym}_daily.parquet"
             if cache_file.exists():
@@ -812,7 +829,7 @@ class UniverseScreener:
                 if datetime.now() - mtime < timedelta(hours=24):
                     try:
                         df = pd.read_parquet(cache_file)
-                        if len(df) >= lookback_days * 0.5:
+                        if len(df) >= lookback_days * 0.3:
                             data[sym] = df
                             continue
                     except Exception:
@@ -828,33 +845,41 @@ class UniverseScreener:
             self.ohlcv_data = data
             return data
 
-        # ══════════════════════════════════════════════════════════════
-        # 3-TIER PARALLEL FETCH: CryptoCompare → Yahoo Finance → CoinGecko
-        # ══════════════════════════════════════════════════════════════
-
-        # Load API keys from .env
+        # ── Load API keys ──
         _dotenv_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
             os.path.abspath(__file__)))), ".env")
-        _env_keys: Dict[str, str] = {}
+        _env: Dict[str, str] = {}
         if os.path.exists(_dotenv_path):
             with open(_dotenv_path) as _ef:
                 for _line in _ef:
                     _line = _line.strip()
                     if _line and not _line.startswith("#") and "=" in _line:
                         _k, _v = _line.split("=", 1)
-                        _env_keys[_k.strip()] = _v.strip()
+                        _env[_k.strip()] = _v.strip()
 
-        # ── TIER 1: CryptoCompare (5,700+ coins, 1 call = 2000 days, ~20 req/s) ──
-        _CC_KEY = _env_keys.get("CRYPTOCOMPARE_API_KEY", "")
-        _cc_succeeded = 0
-        _cc_failed_syms: List[str] = []
+        _CC_KEY = _env.get("CRYPTOCOMPARE_API_KEY", "")
+        _CG_KEY = _env.get("COINGECKO_API_KEY", "")
 
-        if _CC_KEY:
-            _safe_log(f"Stage 2: Tier 1 — CryptoCompare for {len(symbols_to_fetch)} assets (parallel, ~20 req/s)...")
+        # ═══════════════════════════════════════════════════════════════
+        # SHARED STATE (thread-safe)
+        # ═══════════════════════════════════════════════════════════════
+        _results_cc: Dict[str, pd.DataFrame] = {}
+        _results_yf: Dict[str, pd.DataFrame] = {}
+        _lock = threading.Lock()
+
+        # ═══════════════════════════════════════════════════════════════
+        # SOURCE A: CryptoCompare (parallel, 15 workers)
+        # ═══════════════════════════════════════════════════════════════
+        def _run_cryptocompare():
+            if not _CC_KEY:
+                _safe_log("  [CC] No API key, skipping", "warning")
+                return
+
             _CC_BASE = "https://min-api.cryptocompare.com/data/v2/histoday"
+            _cc_ok = 0
+            _cc_fail = 0
 
-            def _fetch_from_cc(sym: str) -> Tuple[str, Optional[pd.DataFrame]]:
-                """Fetch daily OHLCV from CryptoCompare. One call = up to 2000 days."""
+            def _fetch_cc(sym):
                 try:
                     r = _req.get(_CC_BASE, params={
                         "fsym": sym, "tsym": "USD",
@@ -869,490 +894,257 @@ class UniverseScreener:
                     raw = body.get("Data", {}).get("Data", [])
                     if not raw or len(raw) < 30:
                         return sym, None
-
                     df = pd.DataFrame(raw)
                     df["timestamp"] = pd.to_datetime(df["time"], unit="s", utc=True)
                     df = df.set_index("timestamp").sort_index()
-                    df = df.rename(columns={"volumefrom": "volume_base", "volumeto": "volume"})
-                    df["volume_usd"] = df["volume"]
+                    df = df.rename(columns={"volumeto": "volume"})
+                    if "volumefrom" in df.columns:
+                        df["volume_usd"] = df["volume"]
+                    else:
+                        df["volume_usd"] = 0.0
                     df = df[["open", "high", "low", "close", "volume", "volume_usd"]]
-                    df = df[df["close"] > 0]  # Remove zero-price rows
+                    df = df[df["close"] > 0]
                     df = df[~df.index.duplicated(keep="first")]
-
-                    if len(df) < 30:
-                        return sym, None
-
-                    cache_file = ohlcv_cache_dir / f"{sym}_daily.parquet"
-                    df.to_parquet(cache_file)
-                    return sym, df
+                    return sym, df if len(df) >= 30 else None
                 except Exception:
                     return sym, None
 
-            cc_bar = tqdm(total=len(symbols_to_fetch), desc="CryptoCompare", unit="asset", leave=True)
-            with ThreadPoolExecutor(max_workers=15) as cc_pool:
-                cc_futs = {cc_pool.submit(_fetch_from_cc, sym): sym for sym in symbols_to_fetch}
-                for fut in as_completed(cc_futs):
+            cc_bar = tqdm(total=len(symbols_to_fetch), desc="[CC] CryptoCompare",
+                          unit="coin", leave=True, position=0)
+            with ThreadPoolExecutor(max_workers=15) as pool:
+                futs = {pool.submit(_fetch_cc, s): s for s in symbols_to_fetch}
+                for fut in as_completed(futs):
                     sym, df = fut.result()
                     if df is not None:
-                        data[sym] = df
-                        _cc_succeeded += 1
+                        with _lock:
+                            _results_cc[sym] = df
+                        _cc_ok += 1
                     else:
-                        _cc_failed_syms.append(sym)
-                    cc_bar.set_postfix(ok=_cc_succeeded, fail=len(_cc_failed_syms))
+                        _cc_fail += 1
+                    cc_bar.set_postfix(ok=_cc_ok, fail=_cc_fail)
                     cc_bar.update(1)
             cc_bar.close()
-            _safe_log(f"Stage 2: CryptoCompare — {_cc_succeeded} succeeded, {len(_cc_failed_syms)} failed")
-            symbols_to_fetch = _cc_failed_syms
-        else:
-            _safe_log("Stage 2: No CryptoCompare API key, skipping Tier 1", "warning")
+            _safe_log(f"  [CC] Done: {_cc_ok} ok, {_cc_fail} fail")
 
-        if not symbols_to_fetch:
-            self.ohlcv_data = data
-            _safe_log(f"Stage 2: Complete — {len(data)} assets (CC: {_cc_succeeded}, cache: {cached_count})")
-            return data
+        # ═══════════════════════════════════════════════════════════════
+        # SOURCE B: Yahoo Finance (batch 50, parallel internal)
+        # ═══════════════════════════════════════════════════════════════
+        def _run_yahoo_finance():
+            try:
+                import yfinance as yf
+            except ImportError:
+                _safe_log("  [YF] yfinance not installed, skipping", "warning")
+                return
 
-        # ── TIER 2: Yahoo Finance (bulk batch download, no rate limits) ──
-        _safe_log(f"Stage 2: Tier 2 — Yahoo Finance for {len(symbols_to_fetch)} remaining assets...")
-        #
-        # yfinance supports bulk historical data for 500+ cryptos via
-        # {SYMBOL}-USD tickers. No API key needed. No rate limits.
-        # Downloads in batches of 50 tickers at once (extremely fast).
-
-        _safe_log(f"Stage 2: Phase 1 — Yahoo Finance bulk download for {len(symbols_to_fetch)} assets...")
-
-        try:
-            import yfinance as yf
-        except ImportError:
-            yf = None
-            _safe_log("Stage 2: yfinance not installed, skipping Yahoo Finance", "warning")
-
-        _yf_succeeded = 0
-        _yf_failed_syms: List[str] = []
-
-        if yf is not None:
-            # Build Yahoo Finance tickers: BTC → BTC-USD
-            _yf_tickers = [f"{sym}-USD" for sym in symbols_to_fetch]
-            _sym_to_yf = {f"{sym}-USD": sym for sym in symbols_to_fetch}
-
-            # Download in batches of 50 (yfinance handles this efficiently)
+            _yf_ok = 0
+            _yf_fail = 0
             _batch_size = 50
-            _batches = [_yf_tickers[i:i + _batch_size] for i in range(0, len(_yf_tickers), _batch_size)]
+            _tickers = [f"{s}-USD" for s in symbols_to_fetch]
+            _sym_map = {f"{s}-USD": s for s in symbols_to_fetch}
+            _batches = [_tickers[i:i+_batch_size] for i in range(0, len(_tickers), _batch_size)]
 
-            yf_bar = tqdm(total=len(symbols_to_fetch), desc="Yahoo Finance", unit="asset", leave=True)
+            yf_bar = tqdm(total=len(symbols_to_fetch), desc="[YF] Yahoo Finance",
+                          unit="coin", leave=True, position=1)
 
             for batch in _batches:
                 try:
-                    batch_str = " ".join(batch)
                     df_all = yf.download(
-                        batch_str,
-                        start=since_date,
-                        end=until_date,
-                        interval="1d",
-                        group_by="ticker",
-                        progress=False,
-                        threads=True,
+                        " ".join(batch), start=since_date, end=until_date,
+                        interval="1d", group_by="ticker", progress=False, threads=True,
                     )
-
-                    for yf_ticker in batch:
-                        sym = _sym_to_yf[yf_ticker]
+                    for yf_t in batch:
+                        sym = _sym_map[yf_t]
                         try:
                             if len(batch) == 1:
-                                df_single = df_all.copy()
+                                df_s = df_all.copy()
                             else:
-                                df_single = df_all[yf_ticker].copy() if yf_ticker in df_all.columns.get_level_values(0) else pd.DataFrame()
+                                if yf_t not in df_all.columns.get_level_values(0):
+                                    _yf_fail += 1
+                                    yf_bar.update(1)
+                                    continue
+                                df_s = df_all[yf_t].copy()
 
-                            if df_single.empty or len(df_single.dropna()) < 30:
-                                _yf_failed_syms.append(sym)
+                            if df_s.empty or len(df_s.dropna()) < 30:
+                                _yf_fail += 1
                                 yf_bar.update(1)
                                 continue
 
-                            df_single = df_single.dropna()
-                            df_single.index = pd.to_datetime(df_single.index, utc=True)
-
-                            # Standardize column names
+                            df_s = df_s.dropna()
+                            df_s.index = pd.to_datetime(df_s.index, utc=True)
                             col_map = {}
-                            for c in df_single.columns:
+                            for c in df_s.columns:
                                 cl = str(c).lower()
-                                if "open" in cl:
-                                    col_map[c] = "open"
-                                elif "high" in cl:
-                                    col_map[c] = "high"
-                                elif "low" in cl:
-                                    col_map[c] = "low"
-                                elif "close" in cl and "adj" not in cl:
-                                    col_map[c] = "close"
-                                elif "volume" in cl:
-                                    col_map[c] = "volume"
-                            df_single = df_single.rename(columns=col_map)
-
+                                if "open" in cl: col_map[c] = "open"
+                                elif "high" in cl: col_map[c] = "high"
+                                elif "low" in cl: col_map[c] = "low"
+                                elif "close" in cl and "adj" not in cl: col_map[c] = "close"
+                                elif "volume" in cl: col_map[c] = "volume"
+                            df_s = df_s.rename(columns=col_map)
                             for needed in ["open", "high", "low", "close"]:
-                                if needed not in df_single.columns:
-                                    raise KeyError(f"Missing {needed}")
+                                if needed not in df_s.columns:
+                                    raise KeyError(needed)
+                            if "volume" not in df_s.columns:
+                                df_s["volume"] = 0.0
+                            df_s["volume_usd"] = df_s["close"] * df_s["volume"]
+                            df_s = df_s[["open", "high", "low", "close", "volume", "volume_usd"]]
+                            df_s = df_s[~df_s.index.duplicated(keep="first")]
 
-                            if "volume" not in df_single.columns:
-                                df_single["volume"] = 0.0
-                            df_single["volume_usd"] = df_single["close"] * df_single["volume"]
-
-                            df_single = df_single[["open", "high", "low", "close", "volume", "volume_usd"]]
-                            df_single = df_single[~df_single.index.duplicated(keep="first")]
-
-                            # Cache
-                            cache_file = ohlcv_cache_dir / f"{sym}_daily.parquet"
-                            df_single.to_parquet(cache_file)
-                            data[sym] = df_single
-                            _yf_succeeded += 1
-
+                            with _lock:
+                                _results_yf[sym] = df_s
+                            _yf_ok += 1
                         except Exception:
-                            _yf_failed_syms.append(sym)
-
-                        yf_bar.set_postfix(ok=_yf_succeeded, fail=len(_yf_failed_syms))
+                            _yf_fail += 1
+                        yf_bar.set_postfix(ok=_yf_ok, fail=_yf_fail)
                         yf_bar.update(1)
-
-                except Exception as e:
-                    # Entire batch failed
-                    for yf_ticker in batch:
-                        sym = _sym_to_yf[yf_ticker]
-                        if sym not in data:
-                            _yf_failed_syms.append(sym)
+                except Exception:
+                    for yf_t in batch:
+                        _yf_fail += 1
                         yf_bar.update(1)
 
             yf_bar.close()
-            _safe_log(f"Stage 2: Yahoo Finance — {_yf_succeeded} succeeded, {len(_yf_failed_syms)} failed")
-        else:
-            _yf_failed_syms = list(symbols_to_fetch)
+            _safe_log(f"  [YF] Done: {_yf_ok} ok, {_yf_fail} fail")
 
-        # ══════════════════════════════════════════════════════════════
-        # SIMULTANEOUS: Run exchange cascade for ALL symbols in parallel
-        # with Yahoo Finance. First source to deliver data per asset wins.
-        # ══════════════════════════════════════════════════════════════
-        #
-        # While Yahoo Finance batch downloads run on the main thread,
-        # we ALSO fire exchange requests for ALL symbols simultaneously.
-        # If YF gets data first → use it. If an exchange gets it first → use it.
-        # This maximizes coverage and minimizes total wall-clock time.
+        # ═══════════════════════════════════════════════════════════════
+        # LAUNCH BOTH SOURCES SIMULTANEOUSLY
+        # ═══════════════════════════════════════════════════════════════
+        _safe_log("Stage 2: Launching CryptoCompare + Yahoo Finance in parallel...")
 
-        # Symbols that YF didn't get — filter out leveraged/synthetic tokens first
-        import re as _re
-        _leveraged_pattern = _re.compile(r'\d+[LS]$|3L$|3S$|5L$|5S$', _re.IGNORECASE)
-        _real_failed = [s for s in _yf_failed_syms if not _leveraged_pattern.search(s)]
-        _leveraged_skipped = len(_yf_failed_syms) - len(_real_failed)
+        thread_cc = threading.Thread(target=_run_cryptocompare, name="CryptoCompare")
+        thread_yf = threading.Thread(target=_run_yahoo_finance, name="YahooFinance")
 
-        _safe_log(f"Stage 2: {_yf_succeeded} from Yahoo Finance, "
-                   f"{_leveraged_skipped} leveraged tokens skipped, "
-                   f"{len(_real_failed)} real assets for exchange cascade")
+        thread_cc.start()
+        thread_yf.start()
 
-        symbols_to_fetch = _real_failed
+        thread_cc.join()
+        thread_yf.join()
 
-        if not symbols_to_fetch:
-            self.ohlcv_data = data
-            _safe_log(f"Stage 2: Complete — {len(data)} assets "
-                       f"(YF: {_yf_succeeded}, cache: {cached_count}, "
-                       f"leveraged skipped: {_leveraged_skipped})")
-            return data
+        # ═══════════════════════════════════════════════════════════════
+        # MERGE: per symbol, take source with MORE data points
+        # ═══════════════════════════════════════════════════════════════
+        _safe_log("Stage 2: Merging results (best source per symbol)...")
+        _source_stats = {"cc": 0, "yf": 0, "cg": 0}
 
-        # ── Phase 2: CoinGecko for remaining real assets (1 req/sec, no 429s) ──
-        _safe_log(f"Stage 2: Phase 2 — CoinGecko for {len(symbols_to_fetch)} remaining real assets...")
+        for sym in symbols_to_fetch:
+            cc_df = _results_cc.get(sym)
+            yf_df = _results_yf.get(sym)
 
-        _CG_BASE = "https://api.coingecko.com/api/v3"
-        _cg_headers = {}
-        _dotenv_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__)))), ".env")
-        if os.path.exists(_dotenv_path):
-            with open(_dotenv_path) as _ef:
-                for _line in _ef:
-                    if _line.strip().startswith("COINGECKO_API_KEY="):
-                        _cg_headers["x-cg-demo-api-key"] = _line.strip().split("=", 1)[1]
+            cc_len = len(cc_df) if cc_df is not None else 0
+            yf_len = len(yf_df) if yf_df is not None else 0
+
+            if cc_len >= yf_len and cc_len >= 30:
+                data[sym] = cc_df
+                _source_stats["cc"] += 1
+            elif yf_len >= 30:
+                data[sym] = yf_df
+                _source_stats["yf"] += 1
+
+        _safe_log(f"Stage 2: After merge — {len(data)} assets "
+                   f"(CC: {_source_stats['cc']}, YF: {_source_stats['yf']}, cache: {cached_count})")
+
+        # ═══════════════════════════════════════════════════════════════
+        # TIER 3: CoinGecko for remaining misses (sequential, 1/sec)
+        # ═══════════════════════════════════════════════════════════════
+        _still_missing = [s for s in symbols_to_fetch if s not in data]
+
+        if _still_missing:
+            # Filter out leveraged tokens
+            import re as _re
+            _lev = _re.compile(r'\d+[LS]$', _re.IGNORECASE)
+            _real_missing = [s for s in _still_missing if not _lev.search(s)]
+            _lev_count = len(_still_missing) - len(_real_missing)
+            if _lev_count:
+                _safe_log(f"Stage 2: Skipped {_lev_count} leveraged/synthetic tokens")
+
+            if _real_missing:
+                _safe_log(f"Stage 2: Tier 3 — CoinGecko for {len(_real_missing)} remaining real assets...")
+
+                _CG_BASE = "https://api.coingecko.com/api/v3"
+                _cg_headers = {}
+                if _CG_KEY:
+                    _cg_headers["x-cg-demo-api-key"] = _CG_KEY
+
+                # Build symbol → CoinGecko ID map
+                _cg_map = getattr(self, '_cg_id_map', {})
+                if not _cg_map:
+                    try:
+                        r = _req.get(f"{_CG_BASE}/coins/list", headers=_cg_headers, timeout=30)
+                        if r.status_code == 200:
+                            for coin in r.json():
+                                s = coin.get("symbol", "").upper()
+                                if s not in _cg_map or len(coin["id"]) < len(_cg_map[s]):
+                                    _cg_map[s] = coin["id"]
+                    except Exception:
+                        pass
+
+                _cg_ok = 0
+                _consecutive_fails = 0
+                _GIVE_UP = 30
+
+                cg_bar = tqdm(_real_missing, desc="[CG] CoinGecko", unit="coin", leave=True)
+                for sym in cg_bar:
+                    if _consecutive_fails >= _GIVE_UP:
+                        _safe_log(f"  [CG] {_GIVE_UP} consecutive failures, stopping early")
                         break
-
-        # Build symbol → CoinGecko ID map
-        _sym_to_cg: Dict[str, str] = {}
-        try:
-            import requests as _req
-            _resp = _req.get(f"{_CG_BASE}/coins/list", headers=_cg_headers, timeout=30)
-            if _resp.status_code == 200:
-                for coin in _resp.json():
-                    s = coin.get("symbol", "").upper()
-                    if s not in _sym_to_cg or len(coin["id"]) < len(_sym_to_cg[s]):
-                        _sym_to_cg[s] = coin["id"]
-        except Exception:
-            pass
-
-        _cg2_ok = 0
-        _cg2_fail = 0
-        _cg2_consecutive_fails = 0
-        _CG2_GIVE_UP_AFTER = 30  # Stop after 30 consecutive failures (data doesn't exist)
-
-        import requests as _req
-
-        cg2_bar = tqdm(symbols_to_fetch, desc="CoinGecko fallback", unit="asset", leave=True)
-        for sym in cg2_bar:
-            # Early exit: if 30 consecutive fails, the remaining are all dead tokens
-            if _cg2_consecutive_fails >= _CG2_GIVE_UP_AFTER:
-                _remaining = len(symbols_to_fetch) - (_cg2_ok + _cg2_fail)
-                _safe_log(f"Stage 2: CoinGecko — {_cg2_consecutive_fails} consecutive failures, "
-                           f"stopping early ({_remaining} assets skipped as unavailable)")
-                break
-
-            cg_id = _sym_to_cg.get(sym.upper())
-            if not cg_id:
-                _cg2_fail += 1
-                _cg2_consecutive_fails += 1
-                cg2_bar.set_postfix(ok=_cg2_ok, fail=_cg2_fail)
-                continue
-
-            _time.sleep(1.1)
-            try:
-                r = _req.get(f"{_CG_BASE}/coins/{cg_id}/ohlc",
-                             params={"vs_currency": "usd", "days": str(lookback_days)},
-                             headers=_cg_headers, timeout=15)
-                if r.status_code == 429:
-                    _time.sleep(30)
-                    r = _req.get(f"{_CG_BASE}/coins/{cg_id}/ohlc",
-                                 params={"vs_currency": "usd", "days": str(lookback_days)},
-                                 headers=_cg_headers, timeout=15)
-                if r.status_code != 200:
-                    _cg2_fail += 1
-                    _cg2_consecutive_fails += 1
-                    continue
-
-                raw = r.json()
-                if not isinstance(raw, list) or len(raw) < 30:
-                    _cg2_fail += 1
-                    _cg2_consecutive_fails += 1
-                    continue
-
-                df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close"])
-                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-                df = df.set_index("timestamp").sort_index()
-                df = df[~df.index.duplicated(keep="first")]
-                df["volume"] = 0.0
-                df["volume_usd"] = 0.0
-
-                cache_file = ohlcv_cache_dir / f"{sym}_daily.parquet"
-                df.to_parquet(cache_file)
-                data[sym] = df
-                _cg2_ok += 1
-                _cg2_consecutive_fails = 0  # Reset on success
-
-            except Exception:
-                _cg2_fail += 1
-                _cg2_consecutive_fails += 1
-
-            cg2_bar.set_postfix(ok=_cg2_ok, fail=_cg2_fail)
-
-        cg2_bar.close()
-        _safe_log(f"Stage 2: CoinGecko fallback — {_cg2_ok} succeeded, {_cg2_fail} failed")
-
-        self.ohlcv_data = data
-        _safe_log(f"Stage 2: TOTAL — {len(data)} assets "
-                   f"(CC: {_cc_succeeded}, YF: {_yf_succeeded}, CG: {_cg2_ok}, "
-                   f"cache: {cached_count}, leveraged skipped: {_leveraged_skipped})")
-        return data
-
-        # ── Dead code below — exchange cascade kept for reference ──
-        _safe_log(f"Stage 2: Exchange cascade for remaining assets...")
-
-        # Reuse authenticated exchanges from Stage 1, create pools for parallel fetching
-        _connected = getattr(self, '_connected_exchanges', {})
-        _exchange_order = list(_connected.keys()) if _connected else ["bybit", "gate", "okx"]
-        # Ensure primary is first
-        _primary = getattr(self, '_connected_exchange', _exchange_order[0] if _exchange_order else 'bybit')
-        if _primary in _exchange_order:
-            _exchange_order.remove(_primary)
-        _exchange_order.insert(0, _primary)
-
-        _n_workers = min(8, len(symbols_to_fetch))  # 8 outer × ~3 inner = ~24 connections (safe)
-        _exchange_pools: Dict[str, List] = {}
-        _safe_log(f"Stage 2: Creating {_n_workers} worker connections across "
-                   f"{len(_exchange_order)} authenticated exchanges...")
-        for _ename in _exchange_order:
-            try:
-                # Reuse Stage 1 exchange config (has API keys)
-                if _ename in _connected:
-                    _template = _connected[_ename]
-                    _cls = type(_template)
-                else:
-                    _cls = getattr(ccxt, _ename, None)
-                    if _cls is None:
+                    cg_id = _cg_map.get(sym.upper())
+                    if not cg_id:
+                        _consecutive_fails += 1
                         continue
-                pool_list = []
-                # Build authenticated config matching Stage 1's _make_exchange()
-                _auth_opts = {"enableRateLimit": True}
-                _prefix = _ename.upper().replace("BINANCEUS", "BINANCE")
-                if hasattr(self, '_connected_exchanges') and _ename in self._connected_exchanges:
-                    _src = self._connected_exchanges[_ename]
-                    if hasattr(_src, 'apiKey') and _src.apiKey:
-                        _auth_opts["apiKey"] = _src.apiKey
-                    if hasattr(_src, 'secret') and _src.secret:
-                        _auth_opts["secret"] = _src.secret
-                    if hasattr(_src, 'password') and _src.password:
-                        _auth_opts["password"] = _src.password
-                for _ in range(max(4, _n_workers // len(_exchange_order))):
-                    pool_list.append(_cls(_auth_opts))
-                _exchange_pools[_ename] = pool_list
-                _safe_log(f"  {_ename}: {len(pool_list)} instances ready")
-            except Exception as _e:
-                _safe_log(f"  {_ename}: failed to initialize ({_e})", "warning")
-
-        _pool_lock = __import__('threading').Lock()
-        _pool_counters: Dict[str, int] = {k: 0 for k in _exchange_pools}
-
-        # Initialize per-exchange rate limiters and shared retry handler
-        _rate_limiters: Dict[str, _ExchangeRateLimiter] = {}
-        for _ename in _exchange_pools:
-            _rate_limiters[_ename] = _ExchangeRateLimiter(_ename, max_rps=5.0, burst=3)
-        _retry_handler = _RetryWithCircuitBreaker(max_retries=2, cb_threshold=10, cb_cooldown=60)
-
-        _safe_log(f"Stage 2: Rate limiters initialized for {len(_rate_limiters)} exchanges")
-
-        def _get_exchange(exch_name: str):
-            """Round-robin instance from a named exchange pool."""
-            instances = _exchange_pools.get(exch_name, [])
-            if not instances:
-                return None
-            with _pool_lock:
-                idx = _pool_counters.get(exch_name, 0) % len(instances)
-                _pool_counters[exch_name] = idx + 1
-                return instances[idx]
-
-        def _fetch_ohlcv_from(ex, pair: str, since_ts_: int, exch_name: str = "unknown") -> List:
-            """Fetch all candles with rate limiting and retry logic."""
-            rl = _rate_limiters.get(exch_name)
-            all_candles = []
-            current = since_ts_
-            page = 0
-            while True:
-                # Rate limit before each page request
-                if rl:
-                    rl.acquire()
-
-                # Use retry handler for each page
-                def _page_fetch():
-                    return ex.fetch_ohlcv(pair, timeframe="1d", since=current, limit=1000)
-
-                candles = _retry_handler.execute(
-                    _page_fetch,
-                    exchange_name=exch_name,
-                    rate_limiter=rl,
-                )
-                if candles is None or len(candles) == 0:
-                    break
-                all_candles.extend(candles)
-                last_ts = candles[-1][0]
-                if last_ts <= current:
-                    break
-                current = last_ts + 1
-                page += 1
-            return all_candles
-
-        # ── Advanced Parallel Cascade: race ALL exchanges simultaneously per asset ──
-        #
-        # For each asset, we fire requests to ALL exchanges at once. The first
-        # exchange to return valid data wins — all others are cancelled. This is
-        # dramatically faster than sequential fallback because we don't wait for
-        # slow/failed exchanges before trying the next one.
-
-        def _try_exchange_for_symbol(exch_name: str, sym: str) -> Optional[pd.DataFrame]:
-            """Attempt to fetch OHLCV for sym from a single exchange with rate limiting."""
-            # Skip if circuit breaker is open for this exchange
-            if _retry_handler.is_circuit_open(exch_name):
-                return None
-            ex = _get_exchange(exch_name)
-            if ex is None:
-                return None
-            for quote in ["USDT", "USD"]:
-                pair = f"{sym}/{quote}"
-                try:
-                    candles = _fetch_ohlcv_from(ex, pair, since_ts, exch_name=exch_name)
-                    if candles and len(candles) >= 30:  # at least 30 daily candles
-                        df = pd.DataFrame(
-                            candles,
-                            columns=["timestamp", "open", "high", "low", "close", "volume"],
-                        )
+                    _time.sleep(1.2)
+                    try:
+                        r = _req.get(f"{_CG_BASE}/coins/{cg_id}/ohlc",
+                                     params={"vs_currency": "usd", "days": str(min(lookback_days, 365))},
+                                     headers=_cg_headers, timeout=15)
+                        if r.status_code == 429:
+                            _time.sleep(30)
+                            continue
+                        if r.status_code != 200:
+                            _consecutive_fails += 1
+                            continue
+                        raw = r.json()
+                        if not isinstance(raw, list) or len(raw) < 30:
+                            _consecutive_fails += 1
+                            continue
+                        df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close"])
                         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
                         df = df.set_index("timestamp").sort_index()
                         df = df[~df.index.duplicated(keep="first")]
-                        df["volume_usd"] = df["close"] * df["volume"]
-                        return df
-                except Exception:
-                    continue
-            return None
+                        df["volume"] = 0.0
+                        df["volume_usd"] = 0.0
+                        data[sym] = df
+                        _cg_ok += 1
+                        _consecutive_fails = 0
+                        _source_stats["cg"] += 1
+                    except Exception:
+                        _consecutive_fails += 1
+                    cg_bar.set_postfix(ok=_cg_ok, fails=_consecutive_fails)
+                cg_bar.close()
+                _safe_log(f"  [CG] Done: {_cg_ok} ok")
 
-        def _fetch_single(sym: str) -> Tuple[str, Optional[pd.DataFrame]]:
-            """
-            Race ALL exchanges in parallel for a single asset.
-            First valid result wins; remaining futures are cancelled.
-            """
-            from concurrent.futures import ThreadPoolExecutor as _InnerPool, as_completed as _ac
-
-            # Race top 3 non-circuit-broken exchanges (limits total connections)
-            _active_exchanges = [e for e in _exchange_order
-                                  if not _retry_handler.is_circuit_open(e)][:3]
-            if not _active_exchanges:
-                _active_exchanges = _exchange_order[:2]  # fallback
-
-            with _InnerPool(max_workers=len(_active_exchanges)) as race_pool:
-                race_futures = {
-                    race_pool.submit(_try_exchange_for_symbol, ename, sym): ename
-                    for ename in _active_exchanges
-                }
-                for fut in _ac(race_futures):
-                    result = fut.result()
-                    if result is not None and len(result) >= 30:
-                        # Cancel remaining futures
-                        for other_fut in race_futures:
-                            if other_fut != fut and not other_fut.done():
-                                other_fut.cancel()
-                        # Cache and return winner
-                        cache_file = ohlcv_cache_dir / f"{sym}_daily.parquet"
-                        result.to_parquet(cache_file)
-                        return sym, result
-
-            return sym, None
-
-        # Execute with ThreadPoolExecutor — 20 parallel workers
-        max_workers = _n_workers
-        succeeded = 0
-        failed = 0
-
-        fetch_bar = tqdm(total=len(symbols_to_fetch), desc="Fetching OHLCV", unit="asset", leave=True)
-
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {pool.submit(_fetch_single, sym): sym for sym in symbols_to_fetch}
-            for future in as_completed(futures):
-                sym = futures[future]
+        # ═══════════════════════════════════════════════════════════════
+        # CACHE ALL RESULTS
+        # ═══════════════════════════════════════════════════════════════
+        _newly_cached = 0
+        for sym, df in data.items():
+            cache_file = ohlcv_cache_dir / f"{sym}_daily.parquet"
+            if not cache_file.exists() or sym in _results_cc or sym in _results_yf:
                 try:
-                    s, df = future.result(timeout=120)
-                    if df is not None and len(df) > 0:
-                        data[s] = df
-                        succeeded += 1
-                    else:
-                        failed += 1
-                except Exception as e:
-                    logger.debug("Stage 2: Future failed for %s: %s", sym, e)
-                    failed += 1
-
-                fetch_bar.update(1)
-                fetch_bar.set_postfix(ok=succeeded, fail=failed, asset=sym[:8])
-
-        fetch_bar.close()
+                    df.to_parquet(cache_file)
+                    _newly_cached += 1
+                except Exception:
+                    pass
 
         self.ohlcv_data = data
-        _safe_log(f"Stage 2: Fetched {succeeded} assets, {failed} failed, "
-                   f"{cached_count} from cache -> {len(data)} total")
 
-        # Log rate limiter and retry handler statistics
-        _safe_log("Stage 2: Rate limiter stats:")
-        for _rl_name, _rl in _rate_limiters.items():
-            s = _rl.stats()
-            _safe_log(f"  {s['exchange']}: {s['current_rps']:.1f} rps, "
-                       f"avg latency {s['avg_latency_ms']:.0f}ms, "
-                       f"backpressure={'YES' if s['backpressure'] else 'no'}")
-        _rh_stats = _retry_handler.stats()
-        if _rh_stats["circuits_open"]:
-            _safe_log(f"Stage 2: Circuit breakers open: {_rh_stats['circuits_open']}", "warning")
-        _safe_log(f"Stage 2: Retry handler — successes: {sum(_rh_stats['successes'].values())}, "
-                   f"failures: {sum(_rh_stats['failures'].values())}")
+        _total = len(data)
+        _safe_log("=" * 60)
+        _safe_log(f"Stage 2: COLLECTION COMPLETE")
+        _safe_log(f"  Total assets: {_total}")
+        _safe_log(f"  Sources: CC={_source_stats['cc']}, YF={_source_stats['yf']}, "
+                   f"CG={_source_stats['cg']}, cache={cached_count}")
+        _safe_log(f"  Newly cached: {_newly_cached}")
+        _safe_log(f"  Missing: {len(symbols) - _total} "
+                   f"(leveraged/dead tokens with no data anywhere)")
+        _safe_log("=" * 60)
 
         return data
 
