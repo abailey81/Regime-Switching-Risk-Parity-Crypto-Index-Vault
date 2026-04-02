@@ -20,3 +20,4 @@ coverage/
 dashboard/dist/
 dashboard/node_modules/
 *.log
+master_plan_v2.md
