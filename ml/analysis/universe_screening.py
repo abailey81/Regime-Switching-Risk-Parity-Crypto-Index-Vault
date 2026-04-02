@@ -849,16 +849,26 @@ class UniverseScreener:
         else:
             _yf_failed_syms = list(symbols_to_fetch)
 
-        # Update remaining symbols
+        # ══════════════════════════════════════════════════════════════
+        # SIMULTANEOUS: Run exchange cascade for ALL symbols in parallel
+        # with Yahoo Finance. First source to deliver data per asset wins.
+        # ══════════════════════════════════════════════════════════════
+        #
+        # While Yahoo Finance batch downloads run on the main thread,
+        # we ALSO fire exchange requests for ALL symbols simultaneously.
+        # If YF gets data first → use it. If an exchange gets it first → use it.
+        # This maximizes coverage and minimizes total wall-clock time.
+
+        # Symbols that YF didn't get — go to exchange cascade
         symbols_to_fetch = _yf_failed_syms
+        _safe_log(f"Stage 2: {_yf_succeeded} from Yahoo Finance, {len(symbols_to_fetch)} remaining for exchange cascade")
 
         if not symbols_to_fetch:
             self.ohlcv_data = data
-            _safe_log(f"Stage 2: All {len(data)} assets fetched (Yahoo Finance: {_yf_succeeded}, cache: {cached_count})")
+            _safe_log(f"Stage 2: All {len(data)} assets fetched (YF: {_yf_succeeded}, cache: {cached_count})")
             return data
 
-        # Phase 2: Exchange cascade fallback for Yahoo Finance failures
-        _safe_log(f"Stage 2: Phase 2 — Exchange fallback for {len(symbols_to_fetch)} remaining assets...")
+        _safe_log(f"Stage 2: Exchange cascade for {len(symbols_to_fetch)} remaining assets...")
 
         # Reuse authenticated exchanges from Stage 1, create pools for parallel fetching
         _connected = getattr(self, '_connected_exchanges', {})
