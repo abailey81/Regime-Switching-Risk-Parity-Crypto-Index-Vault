@@ -490,7 +490,7 @@ class UniverseScreener:
     #  Stage 1: Universe Construction
     # ══════════════════════════════════════════════════════════════════════════
 
-    def fetch_universe(self, top_n: int = 1000) -> pd.DataFrame:
+    def fetch_universe(self, top_n: int = 5000) -> pd.DataFrame:
         """
         Fetch the top-N cryptocurrencies by market cap from CoinGecko.
 
@@ -2468,9 +2468,9 @@ class UniverseScreener:
 
     def run_full_screening(
         self,
-        top_n: int = 1000,
+        top_n: int = 5000,
         final_n: int = None,
-        lookback_days: int = 730,
+        lookback_days: int = 365,
         n_clusters: int = 30,
         constraints: dict = None,
     ) -> dict:
