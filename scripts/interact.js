@@ -14,8 +14,8 @@ async function main() {
   //         UPDATE WITH YOUR DEPLOYED ADDRESSES
   // ═══════════════════════════════════════════════════
 
-  const VAULT_ADDRESS = "0x_REPLACE_WITH_VAULT_ADDRESS";
-  const MUSDC_ADDRESS = "0x_REPLACE_WITH_MUSDC_ADDRESS";
+  const VAULT_ADDRESS = "0x5D859aDf4b23316C00D3e0c8B7bEAf9f6ea52596";
+  const MUSDC_ADDRESS = "0x3dF734eb2cfae0eA510D5C0bf2c16f632Af3B000";
 
   const vault = await hre.ethers.getContractAt("RiskParityVault", VAULT_ADDRESS);
   const usdc = await hre.ethers.getContractAt("MockERC20", MUSDC_ADDRESS);

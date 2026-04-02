@@ -49,7 +49,7 @@
 | | |
 |---|---|
 | **Network** | Ethereum Sepolia Testnet |
-| **Vault Address** | `0x_TO_BE_UPDATED_AFTER_DEPLOYMENT` |
+| **Vault Address** | `0x5D859aDf4b23316C00D3e0c8B7bEAf9f6ea52596` |
 | **Share Token** | rpCRYPTO (ERC-20 via ERC-4626) |
 | **Underlying** | USDC |
 | **Total Code** | 16,576 lines across 30 Python + 4 Solidity + 4 JS files |

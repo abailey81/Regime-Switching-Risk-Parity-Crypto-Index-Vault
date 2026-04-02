@@ -19,24 +19,24 @@ async function main() {
   // ═══════════════════════════════════════════════════
 
   // Mock token addresses (from deploy_mocks.js output)
-  const MOCK_USDC  = "0x_REPLACE_WITH_MUSDC_ADDRESS";
-  const MOCK_WBTC  = "0x_REPLACE_WITH_MWBTC_ADDRESS";
-  const MOCK_WETH  = "0x_REPLACE_WITH_MWETH_ADDRESS";
-  const MOCK_SOL   = "0x_REPLACE_WITH_MSOL_ADDRESS";
-  const MOCK_STETH = "0x_REPLACE_WITH_MSTETH_ADDRESS";
-  const MOCK_RETH  = "0x_REPLACE_WITH_MRETH_ADDRESS";
-  const MOCK_BUIDL = "0x_REPLACE_WITH_MBUIDL_ADDRESS";
-  const MOCK_USDY  = "0x_REPLACE_WITH_MUSDY_ADDRESS";
+  const MOCK_USDC  = "0x3dF734eb2cfae0eA510D5C0bf2c16f632Af3B000";
+  const MOCK_WBTC  = "0x0fFd700DB7b7B148a225B749534db32e4C04BEe7";
+  const MOCK_WETH  = "0x12907575569f6B9817DCbaD1824CbEc52e2DaFAd";
+  const MOCK_SOL   = "0x74a7934248006Bb8e0e8C740D0fEc336a4cd8DB7";
+  const MOCK_STETH = "0x7e198A3F2eed9Cabb53d4C245A73273942b985Ed";
+  const MOCK_RETH  = "0x50Ad88734F9E64ce1e594744F837792fe372F8c2";
+  const MOCK_BUIDL = "0xA6FA0bFFb602D9d7edc9605Ff8FA34c7b0165c48";
+  const MOCK_USDY  = "0x9d7372473C01Fe2713B70ef4EA6DcEF2c637e819";
 
-  // Mock price feed addresses (from deploy_mocks.js output)
-  const FEED_BTC   = "0x_REPLACE_WITH_BTC_FEED";
-  const FEED_ETH   = "0x_REPLACE_WITH_ETH_FEED";
-  const FEED_SOL   = "0x_REPLACE_WITH_SOL_FEED";
-  const FEED_STETH = "0x_REPLACE_WITH_STETH_FEED";
-  const FEED_RETH  = "0x_REPLACE_WITH_RETH_FEED";
-  const FEED_BUIDL = "0x_REPLACE_WITH_BUIDL_FEED";
-  const FEED_USDY  = "0x_REPLACE_WITH_USDY_FEED";
-  const FEED_USDC  = "0x_REPLACE_WITH_USDC_FEED";
+  // Mock price feed addresses (deployed 2 April 2026)
+  const FEED_BTC   = "0x83752190Ce54db8D0Df5167E2c8b0c0649C8e41C";
+  const FEED_ETH   = "0x87C349B95ABD2Bb4b6a173c892dAaF0FB4Da2A5e";
+  const FEED_SOL   = "0x39d8908669ec3d4aE60B9B745B4523eB2eb6F86D";
+  const FEED_STETH = "0x52fb2aEb8EfA080FF39f077E2fF334EaF6D32897";
+  const FEED_RETH  = "0xcd4D2Ca5d8c4e131E688986C96300edda0f02BF7";
+  const FEED_BUIDL = "0xE24c2b4fe00b028e19edc49c2eda51B89600cE07";
+  const FEED_USDY  = "0x20121F6B496D1F95B3326A00cB0d8E1f0ebB4867";
+  const FEED_USDC  = "0x11D579F65d653Cc88B6a806bd146d691470A0884";
 
   // ═══════════════════════════════════════════════════
   //                  DEPLOY VAULT
