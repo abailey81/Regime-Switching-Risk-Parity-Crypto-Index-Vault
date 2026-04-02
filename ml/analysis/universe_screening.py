@@ -2470,7 +2470,7 @@ class UniverseScreener:
         self,
         top_n: int = 5000,
         final_n: int = None,
-        lookback_days: int = 365,
+        lookback_days: int = 730,
         n_clusters: int = 30,
         constraints: dict = None,
     ) -> dict:
