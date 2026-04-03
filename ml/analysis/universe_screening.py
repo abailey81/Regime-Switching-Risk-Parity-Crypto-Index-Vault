@@ -1041,92 +1041,15 @@ class UniverseScreener:
         _safe_log(f"Stage 2: After merge — {len(data)} assets "
                    f"(CC: {_source_stats['cc']}, YF: {_source_stats['yf']}, cache: {cached_count})")
 
-        # ═══════════════════════════════════════════════════════════════
-        # TIER 3: CoinGecko for remaining misses (sequential, 1/sec)
-        # ═══════════════════════════════════════════════════════════════
+        # Log remaining misses (leveraged tokens / dead coins — no data anywhere)
         _still_missing = [s for s in symbols_to_fetch if s not in data]
-
         if _still_missing:
-            # Filter out leveraged tokens
             import re as _re
             _lev = _re.compile(r'\d+[LS]$', _re.IGNORECASE)
-            _real_missing = [s for s in _still_missing if not _lev.search(s)]
-            _lev_count = len(_still_missing) - len(_real_missing)
-            if _lev_count:
-                _safe_log(f"Stage 2: Skipped {_lev_count} leveraged/synthetic tokens")
-
-            if _real_missing:
-                _safe_log(f"Stage 2: Tier 3 — CoinGecko for {len(_real_missing)} remaining real assets...")
-
-                _CG_BASE = "https://api.coingecko.com/api/v3"
-                _cg_headers = {}
-                if _CG_KEY:
-                    _cg_headers["x-cg-demo-api-key"] = _CG_KEY
-
-                # Build symbol → CoinGecko ID map
-                _cg_map = getattr(self, '_cg_id_map', {})
-                if not _cg_map:
-                    try:
-                        r = _req.get(f"{_CG_BASE}/coins/list", headers=_cg_headers, timeout=30)
-                        if r.status_code == 200:
-                            for coin in r.json():
-                                s = coin.get("symbol", "").upper()
-                                if s not in _cg_map or len(coin["id"]) < len(_cg_map[s]):
-                                    _cg_map[s] = coin["id"]
-                    except Exception:
-                        pass
-
-                _cg_ok = 0
-                _consecutive_fails = 0
-                _GIVE_UP = 15
-                _CG_TIMEOUT = 180  # 3-minute hard timeout
-                _cg_start_time = _time.monotonic()
-
-                cg_bar = tqdm(_real_missing, desc="[CG] CoinGecko (3min max)", unit="coin", leave=True)
-                for sym in cg_bar:
-                    # Hard 3-minute timeout
-                    if _time.monotonic() - _cg_start_time > _CG_TIMEOUT:
-                        _elapsed = int(_time.monotonic() - _cg_start_time)
-                        _safe_log(f"  [CG] 3-minute timeout reached ({_elapsed}s), stopping")
-                        break
-                    if _consecutive_fails >= _GIVE_UP:
-                        _safe_log(f"  [CG] {_GIVE_UP} consecutive failures, stopping early")
-                        break
-                    cg_id = _cg_map.get(sym.upper())
-                    if not cg_id:
-                        _consecutive_fails += 1
-                        continue
-                    _time.sleep(1.2)
-                    try:
-                        r = _req.get(f"{_CG_BASE}/coins/{cg_id}/ohlc",
-                                     params={"vs_currency": "usd", "days": str(min(lookback_days, 365))},
-                                     headers=_cg_headers, timeout=15)
-                        if r.status_code == 429:
-                            _consecutive_fails += 1
-                            _time.sleep(5)  # Short wait, count as failure
-                            continue
-                        if r.status_code != 200:
-                            _consecutive_fails += 1
-                            continue
-                        raw = r.json()
-                        if not isinstance(raw, list) or len(raw) < 30:
-                            _consecutive_fails += 1
-                            continue
-                        df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close"])
-                        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-                        df = df.set_index("timestamp").sort_index()
-                        df = df[~df.index.duplicated(keep="first")]
-                        df["volume"] = 0.0
-                        df["volume_usd"] = 0.0
-                        data[sym] = df
-                        _cg_ok += 1
-                        _consecutive_fails = 0
-                        _source_stats["cg"] += 1
-                    except Exception:
-                        _consecutive_fails += 1
-                    cg_bar.set_postfix(ok=_cg_ok, fails=_consecutive_fails)
-                cg_bar.close()
-                _safe_log(f"  [CG] Done: {_cg_ok} ok")
+            _lev_count = sum(1 for s in _still_missing if _lev.search(s))
+            _dead_count = len(_still_missing) - _lev_count
+            _safe_log(f"Stage 2: {len(_still_missing)} assets unavailable "
+                       f"({_lev_count} leveraged tokens, {_dead_count} dead/delisted)")
 
         # ═══════════════════════════════════════════════════════════════
         # CACHE ALL RESULTS
