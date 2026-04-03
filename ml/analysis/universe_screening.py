@@ -1055,12 +1055,6 @@ class UniverseScreener:
             if _lev_count:
                 _safe_log(f"Stage 2: Skipped {_lev_count} leveraged/synthetic tokens")
 
-            # Skip CoinGecko if we already have enough data (500+)
-            if len(data) >= 500:
-                _safe_log(f"Stage 2: Already have {len(data)} assets — skipping CoinGecko tier "
-                           f"({len(_real_missing)} remaining are likely dead/delisted tokens)")
-                _real_missing = []
-
             if _real_missing:
                 _safe_log(f"Stage 2: Tier 3 — CoinGecko for {len(_real_missing)} remaining real assets...")
 
@@ -1084,10 +1078,17 @@ class UniverseScreener:
 
                 _cg_ok = 0
                 _consecutive_fails = 0
-                _GIVE_UP = 15  # Stop faster — if 15 in a row fail, remaining are all junk
+                _GIVE_UP = 15
+                _CG_TIMEOUT = 180  # 3-minute hard timeout
+                _cg_start_time = _time.monotonic()
 
-                cg_bar = tqdm(_real_missing, desc="[CG] CoinGecko", unit="coin", leave=True)
+                cg_bar = tqdm(_real_missing, desc="[CG] CoinGecko (3min max)", unit="coin", leave=True)
                 for sym in cg_bar:
+                    # Hard 3-minute timeout
+                    if _time.monotonic() - _cg_start_time > _CG_TIMEOUT:
+                        _elapsed = int(_time.monotonic() - _cg_start_time)
+                        _safe_log(f"  [CG] 3-minute timeout reached ({_elapsed}s), stopping")
+                        break
                     if _consecutive_fails >= _GIVE_UP:
                         _safe_log(f"  [CG] {_GIVE_UP} consecutive failures, stopping early")
                         break
