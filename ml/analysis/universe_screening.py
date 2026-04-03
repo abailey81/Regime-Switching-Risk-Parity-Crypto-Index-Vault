@@ -1055,6 +1055,12 @@ class UniverseScreener:
             if _lev_count:
                 _safe_log(f"Stage 2: Skipped {_lev_count} leveraged/synthetic tokens")
 
+            # Skip CoinGecko if we already have enough data (500+)
+            if len(data) >= 500:
+                _safe_log(f"Stage 2: Already have {len(data)} assets — skipping CoinGecko tier "
+                           f"({len(_real_missing)} remaining are likely dead/delisted tokens)")
+                _real_missing = []
+
             if _real_missing:
                 _safe_log(f"Stage 2: Tier 3 — CoinGecko for {len(_real_missing)} remaining real assets...")
 
